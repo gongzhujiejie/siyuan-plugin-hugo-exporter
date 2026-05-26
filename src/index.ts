@@ -14,6 +14,9 @@ import { exportPushBundle, resolveGitBinary, verifyGitRepository } from "./adapt
 import { hasActiveDocument, NoActiveDocumentError, readCurrentDocumentSnapshot } from "./adapters/siyuan";
 import {
   DEFAULT_PLUGIN_CONFIG,
+  EXAMPLE_CATEGORY_OPTIONS,
+  EXAMPLE_COLLECTION_OPTIONS,
+  EXAMPLE_TAG_OPTIONS,
   type HugoExporterConfig,
   mergePluginConfig,
   parseLinesToOptions,
@@ -83,7 +86,7 @@ function stringifyOptions(options: string[]): string {
  * 当前版本提供：自定义顶栏图标 + 合并导出入口 + 配置页 + dry-run / 正式导出。
  */
 export default class HugoExporterPlugin extends Plugin {
-  private static readonly VERSION = "0.2.1";
+  private static readonly VERSION = "0.2.2";
   private config: HugoExporterConfig = DEFAULT_PLUGIN_CONFIG;
   /** lastForms 是按 docId 缓存的最近一次表单填写值，用于 B6 表单字段记忆。 */
   private lastForms: Record<string, Record<string, unknown>> = {};
@@ -504,6 +507,31 @@ export default class HugoExporterPlugin extends Plugin {
     // ------ 维护操作 ------
     sectionHeader("【四】维护", "重置配置等不常用操作");
     safeAddItem({
+      title: "加载示例候选项",
+      description: "把通用示例（如 技术 / 随笔 / 教程 等）合并到 categories/tags 候选中，初次安装快速上手。已存在的不重复添加。",
+      build: () => {
+        const button = document.createElement("button");
+        button.className = "b3-button b3-button--outline";
+        button.textContent = "加载示例";
+        button.addEventListener("click", () => {
+          const merged = mergePluginConfig({
+            ...this.config,
+            categoryOptions: this.unionStrings(this.config.categoryOptions, EXAMPLE_CATEGORY_OPTIONS),
+            tagOptions: this.unionStrings(this.config.tagOptions, EXAMPLE_TAG_OPTIONS),
+            collectionOptions: this.unionStrings(this.config.collectionOptions, EXAMPLE_COLLECTION_OPTIONS),
+          });
+          this.config = merged;
+          // NOTE: 同步到设置页 textarea；魔尊点保存时才落盘，避免误操作。
+          if (inputs.categoryOptions) inputs.categoryOptions.value = stringifyOptions(merged.categoryOptions);
+          if (inputs.tagOptions) inputs.tagOptions.value = stringifyOptions(merged.tagOptions);
+          if (inputs.collectionOptions) inputs.collectionOptions.value = stringifyOptions(merged.collectionOptions);
+          showMessage("已加载示例候选项；点底部「保存」生效");
+        });
+        return button;
+      },
+    });
+
+    safeAddItem({
       title: "重置为默认配置",
       description: "把所有配置（含候选项、Git 设置）恢复成插件出厂默认值；操作前会要求确认。",
       build: () => {
@@ -571,6 +599,9 @@ export default class HugoExporterPlugin extends Plugin {
         gitRemote: this.config.gitRemote,
         gitBranch: this.config.gitBranch,
         lastValues,
+        // NOTE: 用户在弹窗里临时新增的候选项，立即合并到 config 并 saveData，
+        //       下次开任意文档都能在 chip 列表里看到。
+        onAddOption: (key, added) => void this.persistOptionAdditions(key, added),
       });
       if (!outcome) {
         // NOTE: 用户取消，不视为错误，也不弹失败提示。
@@ -733,7 +764,6 @@ export default class HugoExporterPlugin extends Plugin {
     }
   }
 
-  /** rememberLastForm 把本次填的非 title/date/lastmod 字段缓存到 storage，便于下次预填。 */
   private async rememberLastForm(docId: string, frontmatter: Record<string, unknown>): Promise<void> {
     if (!docId) return;
     const cleaned: Record<string, unknown> = {};
@@ -746,6 +776,43 @@ export default class HugoExporterPlugin extends Plugin {
       await this.saveData(STORAGE_LAST_FORM, this.lastForms);
     } catch (error) {
       console.warn("[hugo-exporter] saveData last-form failed", error);
+    }
+  }
+
+  /**
+   * persistOptionAdditions 把用户在弹窗里临时新增的候选项写回 config 并持久化。
+   * 输入：字段 key（categories/tags/collections）、新增值数组。
+   *
+   * 行为：
+   * - 仅追加未存在过的值，不重复；
+   * - 立刻 saveData 到思源 storage，下次打开任意文档都能看到；
+   * - saveData 失败时仅 console 警告，不打断主流程（用户已选中的 chip 不丢）。
+   */
+  private async persistOptionAdditions(
+    key: "categories" | "tags" | "collections",
+    added: string[],
+  ): Promise<void> {
+    if (added.length === 0) return;
+    const fieldKey =
+      key === "categories" ? "categoryOptions" : key === "tags" ? "tagOptions" : "collectionOptions";
+    const current = this.config[fieldKey];
+    const merged = [...current];
+    let changed = false;
+    for (const item of added) {
+      const trimmed = item.trim();
+      if (!trimmed) continue;
+      if (!merged.includes(trimmed)) {
+        merged.push(trimmed);
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    this.config = { ...this.config, [fieldKey]: merged };
+    try {
+      await this.saveData(STORAGE_NAME, this.config);
+      console.log(`[hugo-exporter] persisted ${added.length} new ${key}`, added);
+    } catch (error) {
+      console.warn(`[hugo-exporter] persist ${key} failed`, error);
     }
   }
 
@@ -885,6 +952,19 @@ export default class HugoExporterPlugin extends Plugin {
     const text = `Hugo 推送完成：${this.config.gitRemote}/${this.config.gitBranch} · ${commitMessage}`;
     showMessage(text);
     return { ok: true, text };
+  }
+
+  /** unionStrings 合并两个字符串数组，去重去空白，保留前一个数组的顺序优先。 */
+  private unionStrings(base: string[], extra: string[]): string[] {
+    const seen = new Set<string>();
+    const result: string[] = [];
+    for (const item of [...base, ...extra]) {
+      const trimmed = (item ?? "").trim();
+      if (!trimmed || seen.has(trimmed)) continue;
+      seen.add(trimmed);
+      result.push(trimmed);
+    }
+    return result;
   }
 
   /**

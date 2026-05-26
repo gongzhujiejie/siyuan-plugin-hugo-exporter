@@ -88,6 +88,16 @@ describe("DEFAULT_PLUGIN_CONFIG git defaults", () => {
     expect(DEFAULT_PLUGIN_CONFIG.pullBeforePush).toBe(false);
     expect(DEFAULT_PLUGIN_CONFIG.gitBinary).toBe("");
   });
+
+  it("does not ship with any author-specific personal data", () => {
+    // NOTE: 防回归测试：仓库代码里不要再夹带任何作者私货数据，
+    //       avoid accidentally exposing personal categories/tags/repo paths to other users.
+    expect(DEFAULT_PLUGIN_CONFIG.repoRoot).toBe("");
+    expect(DEFAULT_PLUGIN_CONFIG.assetBasePath).toBe("");
+    expect(DEFAULT_PLUGIN_CONFIG.categoryOptions).toEqual([]);
+    expect(DEFAULT_PLUGIN_CONFIG.tagOptions).toEqual([]);
+    expect(DEFAULT_PLUGIN_CONFIG.collectionOptions).toEqual([]);
+  });
 });
 
 describe("mergePluginConfig type guards", () => {

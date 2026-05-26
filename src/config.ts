@@ -40,24 +40,37 @@ export interface HugoExporterConfig {
   pullBeforePush: boolean;
 }
 
-/** DEFAULT_FRONTMATTER_YAML 是符合当前 FixIt 博客习惯的最小默认 frontmatter。 */
+/** DEFAULT_FRONTMATTER_YAML 是符合多数博客主题（FixIt / Hugo 默认）的通用 frontmatter 起步模板。 */
 export const DEFAULT_FRONTMATTER_YAML = `description: ""
 wordCount: true
 math: true
 draft: false
 `;
 
-/** DEFAULT_PLUGIN_CONFIG 面向魔尊当前 Windows 本地博客给出可立即使用的默认值。 */
+/**
+ * EXAMPLE_CATEGORY_OPTIONS 等"示例候选"是给新用户参考的，不写进默认配置。
+ * 设置页会暴露「加载示例候选项」按钮，点击后才注入到当前用户配置。
+ */
+export const EXAMPLE_CATEGORY_OPTIONS = ["技术", "随笔", "教程"];
+export const EXAMPLE_TAG_OPTIONS = ["前端", "后端", "工具"];
+export const EXAMPLE_COLLECTION_OPTIONS: string[] = [];
+
+/**
+ * DEFAULT_PLUGIN_CONFIG 是发布给所有用户的默认值，必须保持"通用且空"。
+ * - 路径相关：repoRoot / assetBasePath 留空，用户必须自己填，避免误写到错误目录。
+ * - 候选项：默认空数组，免得新用户看到一堆莫名的分类。
+ * - 默认 YAML 保留通用模板，对所有 Hugo 主题都适用。
+ */
 export const DEFAULT_PLUGIN_CONFIG: HugoExporterConfig = {
-  repoRoot: "I:/my-blog",
+  repoRoot: "",
   contentDir: "content/posts",
   assetSubDir: "images",
-  assetBasePath: "I:/my-blog",
+  assetBasePath: "",
   dryRunDefault: false,
   defaultFrontmatterYaml: DEFAULT_FRONTMATTER_YAML,
-  categoryOptions: ["MAZESEC", "渗透测试", "随笔"],
-  tagOptions: ["靶机", "Samba", "Linux", "Windows"],
-  collectionOptions: ["MAZESEC Writeups"],
+  categoryOptions: [],
+  tagOptions: [],
+  collectionOptions: [],
   gitEnabled: true,
   gitBinary: "",
   gitRemote: "origin",

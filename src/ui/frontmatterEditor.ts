@@ -70,6 +70,12 @@ export interface FrontmatterEditorOptions {
    * title/date/lastmod 永远从思源文档实时取，不会被 lastValues 覆盖。
    */
   lastValues?: Record<string, unknown>;
+  /**
+   * onAddOption 在用户在弹窗里输入新候选项时回调（一次可能多个）。
+   * key 为 "categories" / "tags" / "collections"。
+   * 调用方应把这些新值持久化到设置中的对应数组。
+   */
+  onAddOption?: (key: "categories" | "tags" | "collections", added: string[]) => void;
 }
 
 interface FieldRow {
@@ -113,7 +119,20 @@ function createRowShell(form: HTMLElement, field: FrontmatterFieldConfig): { ite
  * createSelectableArrayInput 渲染 chip 多选 + 自由输入组件。
  * 适用于 categories / tags / collections：候选项由设置页维护，临时新值可直接输入并用于本次导出。
  */
-function createSelectableArrayInput(valueBox: HTMLElement, initialValue: unknown, configuredOptions: string[]): () => string[] {
+/**
+ * createSelectableArrayInput 渲染 chip 多选 + 自由输入。
+ * 输入：valueBox 容器、初始值、当前候选项白名单、可选的 onAddOption 回调。
+ *
+ * onAddOption 在用户输入新值（即 + 按钮 / 回车追加候选）时调用，
+ * runExport 会借此把新值写回 config.{categoryOptions/tagOptions/...} 并 saveData，
+ * 这样魔尊本次新加的标签下次开弹窗仍然在。
+ */
+function createSelectableArrayInput(
+  valueBox: HTMLElement,
+  initialValue: unknown,
+  configuredOptions: string[],
+  onAddOption?: (added: string[]) => void,
+): () => string[] {
   let selected = parseArrayInput(stringifyArray(initialValue));
   let options = mergeOptionValues(configuredOptions, selected);
   let filterText = "";
@@ -195,12 +214,21 @@ function createSelectableArrayInput(valueBox: HTMLElement, initialValue: unknown
   const addCustomValue = (): void => {
     const additions = parseArrayInput(customInput.value);
     if (additions.length === 0) return;
+    const newlyAdded: string[] = [];
     for (const item of additions) {
-      if (!options.includes(item)) options = [...options, item];
+      if (!options.includes(item)) {
+        options = [...options, item];
+        newlyAdded.push(item);
+      }
       if (!selected.includes(item)) selected = [...selected, item];
     }
     customInput.value = "";
     renderChips();
+    // NOTE: 通知调用方有新候选项，runExport 据此写回 config + saveData，
+    //       下次开弹窗仍能看到这些项。
+    if (newlyAdded.length > 0) {
+      onAddOption?.(newlyAdded);
+    }
   };
 
   addButton.addEventListener("click", addCustomValue);
@@ -234,7 +262,12 @@ function createFieldRow(
   } else if (field.type === "array") {
     const configuredOptions = getFieldOptions(field.key, options);
     if (["categories", "tags", "collections"].includes(field.key)) {
-      read = createSelectableArrayInput(valueBox, initialValue, configuredOptions);
+      // NOTE: 新增候选时回调到 runExport，把新值写回 config 持久化（B6 + 魔尊本期需求）。
+      const onAdd = options?.onAddOption
+        ? (added: string[]) =>
+            options.onAddOption?.(field.key as "categories" | "tags" | "collections", added)
+        : undefined;
+      read = createSelectableArrayInput(valueBox, initialValue, configuredOptions, onAdd);
     } else {
       const textarea = document.createElement("textarea");
       textarea.className = "b3-text-field fn__block";
