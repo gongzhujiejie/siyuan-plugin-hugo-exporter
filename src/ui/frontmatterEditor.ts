@@ -8,7 +8,7 @@
  * 安全说明：所有用户输入只用 textContent / value 写入 DOM，避免 XSS；
  * 数组字段严格 trim、去空项、去重，路径预览只做展示，真实安全校验仍交给导出核心。
  */
-import { Dialog } from "siyuan";
+import { confirm, Dialog, Menu, showMessage } from "siyuan";
 import yaml from "js-yaml";
 import { FIXIT_BLOG_PRESET } from "../presets/fixitBlog";
 import type { FrontmatterFieldConfig, SiYuanDocumentSnapshot } from "../core/types";
@@ -76,6 +76,13 @@ export interface FrontmatterEditorOptions {
    * 调用方应把这些新值持久化到设置中的对应数组。
    */
   onAddOption?: (key: "categories" | "tags" | "collections", added: string[]) => void;
+  /**
+   * onRenameOption 在用户重命名候选项时回调；调用方应把 oldName→newName 应用到 config 并 saveData。
+   * 同时调用方需考虑：是否把 lastForms 里所有引用 oldName 的字段也替换为 newName（推荐）。
+   */
+  onRenameOption?: (key: "categories" | "tags" | "collections", oldName: string, newName: string) => void;
+  /** onDeleteOption 在用户从候选库永久删除某项时回调。 */
+  onDeleteOption?: (key: "categories" | "tags" | "collections", name: string) => void;
 }
 
 interface FieldRow {
@@ -97,6 +104,93 @@ function getFieldOptions(fieldKey: string, options?: FrontmatterEditorOptions): 
   return [];
 }
 
+/**
+ * promptString 弹一个简单的字符串输入对话框。
+ * 输入：title / message（多行 textContent）/ defaultValue / placeholder。
+ * 返回：用户输入的字符串；点取消 / 关闭返回 null。
+ *
+ * NOTE: 思源 SDK 自带的 confirm 不接收输入，这里自建一个最小 prompt UI；
+ *       不引入新依赖，所有节点都用 textContent / value 写入避免 XSS。
+ */
+function promptString(input: {
+  title: string;
+  message?: string;
+  defaultValue?: string;
+  placeholder?: string;
+}): Promise<string | null> {
+  return new Promise((resolve) => {
+    const root = document.createElement("div");
+    root.style.cssText = "padding:16px 18px;display:flex;flex-direction:column;gap:10px";
+
+    if (input.message) {
+      const msg = document.createElement("div");
+      msg.style.cssText =
+        "font-size:12px;color:var(--b3-theme-on-surface-light);white-space:pre-wrap;word-break:break-all;line-height:1.6";
+      msg.textContent = input.message;
+      root.appendChild(msg);
+    }
+
+    const inputEl = document.createElement("input");
+    inputEl.type = "text";
+    inputEl.className = "b3-text-field fn__block";
+    inputEl.value = input.defaultValue ?? "";
+    inputEl.placeholder = input.placeholder ?? "";
+    root.appendChild(inputEl);
+
+    const buttonBar = document.createElement("div");
+    buttonBar.style.cssText = "display:flex;justify-content:flex-end;gap:8px;padding-top:4px";
+    const cancelBtn = document.createElement("button");
+    cancelBtn.type = "button";
+    cancelBtn.className = "b3-button b3-button--cancel";
+    cancelBtn.textContent = "取消";
+    const confirmBtn = document.createElement("button");
+    confirmBtn.type = "button";
+    confirmBtn.className = "b3-button b3-button--text";
+    confirmBtn.textContent = "确定";
+    buttonBar.appendChild(cancelBtn);
+    buttonBar.appendChild(confirmBtn);
+    root.appendChild(buttonBar);
+
+    let resolved = false;
+    const finish = (value: string | null): void => {
+      if (resolved) return;
+      resolved = true;
+      resolve(value);
+    };
+
+    const dialog = new Dialog({
+      title: input.title,
+      content: '<div id="hugo-prompt-string"></div>',
+      width: "440px",
+      height: "auto",
+      destroyCallback: () => finish(null),
+    });
+    const mountPoint = dialog.element.querySelector("#hugo-prompt-string");
+    if (mountPoint) mountPoint.appendChild(root);
+    setTimeout(() => inputEl.focus(), 0);
+
+    cancelBtn.addEventListener("click", () => {
+      finish(null);
+      dialog.destroy();
+    });
+    confirmBtn.addEventListener("click", () => {
+      finish(inputEl.value);
+      dialog.destroy();
+    });
+    inputEl.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        finish(inputEl.value);
+        dialog.destroy();
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        finish(null);
+        dialog.destroy();
+      }
+    });
+  });
+}
+
 /** createRowShell 创建每个 frontmatter 字段共用的左右布局。 */
 function createRowShell(form: HTMLElement, field: FrontmatterFieldConfig): { item: HTMLDivElement; valueBox: HTMLDivElement } {
   const item = document.createElement("div");
@@ -116,26 +210,32 @@ function createRowShell(form: HTMLElement, field: FrontmatterFieldConfig): { ite
 }
 
 /**
- * createSelectableArrayInput 渲染 chip 多选 + 自由输入组件。
- * 适用于 categories / tags / collections：候选项由设置页维护，临时新值可直接输入并用于本次导出。
- */
-/**
- * createSelectableArrayInput 渲染 chip 多选 + 自由输入。
- * 输入：valueBox 容器、初始值、当前候选项白名单、可选的 onAddOption 回调。
+ * createSelectableArrayInput 渲染 chip 多选 + 自由输入 + 候选项管理（重命名/删除）。
+ * 输入：
+ *   - valueBox: 容器
+ *   - initialValue: 初始值（已选项）
+ *   - configuredOptions: 当前候选项白名单（来自 config）
+ *   - onAddOption: 用户输入新值时回调（runExport 据此写回 config）
+ *   - onRenameOption: 用户重命名候选项时回调；旧值即将从候选库移除，新值加入
+ *   - onDeleteOption: 用户从候选库删除某项时回调
  *
- * onAddOption 在用户输入新值（即 + 按钮 / 回车追加候选）时调用，
- * runExport 会借此把新值写回 config.{categoryOptions/tagOptions/...} 并 saveData，
- * 这样魔尊本次新加的标签下次开弹窗仍然在。
+ * 设计：左键单击 chip = 切换选中（保持现状）；chip 右上角的齿轮按钮 = 进入管理菜单。
+ *       这样"选中"与"管理候选"两种语义不会在同一个左键里争用，避免误删。
  */
 function createSelectableArrayInput(
   valueBox: HTMLElement,
   initialValue: unknown,
   configuredOptions: string[],
   onAddOption?: (added: string[]) => void,
+  onRenameOption?: (oldName: string, newName: string) => void,
+  onDeleteOption?: (name: string) => void,
 ): () => string[] {
   let selected = parseArrayInput(stringifyArray(initialValue));
   let options = mergeOptionValues(configuredOptions, selected);
   let filterText = "";
+  // configuredSet 只记"在 config 候选库里的项"，本次临时新加的（还没保存的）不能管理。
+  // NOTE: 使用 Set 而非 Array.includes，候选过多时 lookup 更快。
+  const configuredSet = new Set<string>(configuredOptions);
 
   const chips = document.createElement("div");
   // NOTE: chip 区超过 96px 自动滚动，避免候选过多撑爆表单（B8）。
@@ -174,6 +274,55 @@ function createSelectableArrayInput(
   valueBox.appendChild(chips);
   valueBox.appendChild(inputRow);
 
+  /** handleRename 弹小输入对话框完成重命名，并联动更新已选项 + 通知调用方持久化。 */
+  const handleRename = (oldName: string): void => {
+    void promptString({
+      title: "重命名候选项",
+      message: `把「${oldName}」改成什么？\n\n这会同时更新本次表单里已选中的同名项。已发布的文章不受影响。`,
+      defaultValue: oldName,
+      placeholder: "新名称",
+    }).then((nextRaw) => {
+      if (nextRaw === null) return;
+      const next = nextRaw.trim();
+      if (!next || next === oldName) return;
+
+      // 冲突合并：新名已存在 → 把"旧名 = 新名"，重命名等价于把 oldName 从候选移除。
+      const conflict = options.includes(next) && next !== oldName;
+
+      options = options
+        .map((item) => (item === oldName ? next : item))
+        .filter((item, idx, arr) => arr.indexOf(item) === idx);
+      selected = selected
+        .map((item) => (item === oldName ? next : item))
+        .filter((item, idx, arr) => arr.indexOf(item) === idx);
+      configuredSet.delete(oldName);
+      configuredSet.add(next);
+      renderChips();
+      onRenameOption?.(oldName, next);
+      if (conflict) {
+        showMessage(`「${next}」已存在，已合并为同一个候选项`);
+      }
+    });
+  };
+
+  /** handleDelete 二次确认后从候选库移除一项，本次已选中的同名项也会被取消选中。 */
+  const handleDelete = (name: string): void => {
+    confirm(
+      "从候选库删除",
+      `把「${name}」从候选库永久删除？\n\n` +
+        "• 之后再开导出弹窗都不会再出现这一项；\n" +
+        "• 本次表单里若已选中此项，会自动取消选中；\n" +
+        "• 已发布的文章不受影响（远端 frontmatter 里仍有这个值）。",
+      () => {
+        options = options.filter((item) => item !== name);
+        selected = selected.filter((item) => item !== name);
+        configuredSet.delete(name);
+        renderChips();
+        onDeleteOption?.(name);
+      },
+    );
+  };
+
   const renderChips = (): void => {
     chips.textContent = "";
     if (options.length === 0) {
@@ -198,16 +347,59 @@ function createSelectableArrayInput(
 
     for (const option of visible) {
       const active = selected.includes(option);
+      const isManaged = configuredSet.has(option);
+
+      // chipWrap 用 inline-flex 作为外壳，把 chip 主体和齿轮按钮当成同一个视觉单元；
+      // 二者都是独立的 button，避免 DOM 嵌套 button（HTML 不允许）。
+      const chipWrap = document.createElement("span");
+      chipWrap.style.cssText = "display:inline-flex;align-items:stretch;border-radius:6px;overflow:hidden";
+
       const chip = document.createElement("button");
       chip.type = "button";
       chip.className = active ? "b3-button b3-button--text" : "b3-button b3-button--outline";
-      chip.style.cssText = "padding:2px 8px;font-size:12px";
+      chip.style.cssText = "padding:2px 8px;font-size:12px;border-radius:6px 0 0 6px";
       chip.textContent = active ? `${option} ✓` : option;
+      chip.title = "点击切换选中";
       chip.addEventListener("click", () => {
         selected = toggleArrayValue(selected, option);
         renderChips();
       });
-      chips.appendChild(chip);
+      chipWrap.appendChild(chip);
+
+      // 仅"在候选库里的项"才显示管理按钮；本次临时新加的（还没 saveData）不显示，
+      // 一是避免对未保存的项重命名引起混乱，二是让 UI 直观区分"持久 vs 临时"。
+      if (isManaged && (onRenameOption || onDeleteOption)) {
+        const gear = document.createElement("button");
+        gear.type = "button";
+        gear.className = "b3-button b3-button--outline";
+        gear.style.cssText =
+          "padding:2px 6px;font-size:11px;border-left:1px dashed var(--b3-border-color);border-radius:0 6px 6px 0;cursor:pointer";
+        gear.textContent = "⋯";
+        gear.title = "管理候选项：重命名 / 删除";
+        gear.addEventListener("click", (event) => {
+          event.stopPropagation();
+          const rect = gear.getBoundingClientRect();
+          const menu = new Menu("hugo-chip-manage");
+          if (onRenameOption) {
+            menu.addItem({
+              icon: "iconEdit",
+              label: "重命名…",
+              click: () => handleRename(option),
+            });
+          }
+          if (onDeleteOption) {
+            menu.addItem({
+              icon: "iconTrashcan",
+              label: "从候选库删除",
+              click: () => handleDelete(option),
+            });
+          }
+          menu.open({ x: rect.left, y: rect.bottom });
+        });
+        chipWrap.appendChild(gear);
+      }
+
+      chips.appendChild(chipWrap);
     }
   };
 
@@ -223,9 +415,10 @@ function createSelectableArrayInput(
       if (!selected.includes(item)) selected = [...selected, item];
     }
     customInput.value = "";
+    // NOTE: 新加的项一旦持久化（runExport 会调 onAddOption 触发 saveData），
+    //       下次重开弹窗就在 configuredSet 里；这里乐观先加进去，让齿轮立即出现。
+    for (const item of newlyAdded) configuredSet.add(item);
     renderChips();
-    // NOTE: 通知调用方有新候选项，runExport 据此写回 config + saveData，
-    //       下次开弹窗仍能看到这些项。
     if (newlyAdded.length > 0) {
       onAddOption?.(newlyAdded);
     }
@@ -262,12 +455,17 @@ function createFieldRow(
   } else if (field.type === "array") {
     const configuredOptions = getFieldOptions(field.key, options);
     if (["categories", "tags", "collections"].includes(field.key)) {
-      // NOTE: 新增候选时回调到 runExport，把新值写回 config 持久化（B6 + 魔尊本期需求）。
+      const fieldKey = field.key as "categories" | "tags" | "collections";
       const onAdd = options?.onAddOption
-        ? (added: string[]) =>
-            options.onAddOption?.(field.key as "categories" | "tags" | "collections", added)
+        ? (added: string[]) => options.onAddOption?.(fieldKey, added)
         : undefined;
-      read = createSelectableArrayInput(valueBox, initialValue, configuredOptions, onAdd);
+      const onRename = options?.onRenameOption
+        ? (oldName: string, newName: string) => options.onRenameOption?.(fieldKey, oldName, newName)
+        : undefined;
+      const onDelete = options?.onDeleteOption
+        ? (name: string) => options.onDeleteOption?.(fieldKey, name)
+        : undefined;
+      read = createSelectableArrayInput(valueBox, initialValue, configuredOptions, onAdd, onRename, onDelete);
     } else {
       const textarea = document.createElement("textarea");
       textarea.className = "b3-text-field fn__block";

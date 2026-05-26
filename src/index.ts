@@ -86,7 +86,7 @@ function stringifyOptions(options: string[]): string {
  * 当前版本提供：自定义顶栏图标 + 合并导出入口 + 配置页 + dry-run / 正式导出。
  */
 export default class HugoExporterPlugin extends Plugin {
-  private static readonly VERSION = "0.2.2";
+  private static readonly VERSION = "0.2.3";
   private config: HugoExporterConfig = DEFAULT_PLUGIN_CONFIG;
   /** lastForms 是按 docId 缓存的最近一次表单填写值，用于 B6 表单字段记忆。 */
   private lastForms: Record<string, Record<string, unknown>> = {};
@@ -602,6 +602,13 @@ export default class HugoExporterPlugin extends Plugin {
         // NOTE: 用户在弹窗里临时新增的候选项，立即合并到 config 并 saveData，
         //       下次开任意文档都能在 chip 列表里看到。
         onAddOption: (key, added) => void this.persistOptionAdditions(key, added),
+        // NOTE: 重命名候选项：替换 config 候选库里的同名项；
+        //       同时把 lastForms 里所有 docId 下引用 oldName 的对应字段值也替换，避免下次预填出现"幽灵旧值"。
+        onRenameOption: (key, oldName, newName) =>
+          void this.persistOptionRename(key, oldName, newName),
+        // NOTE: 删除候选项：从 config 候选库里移除；
+        //       lastForms 里的"已选中此值"也一并清掉，避免下次预填又出现一个已被删除的标签。
+        onDeleteOption: (key, name) => void this.persistOptionDelete(key, name),
       });
       if (!outcome) {
         // NOTE: 用户取消，不视为错误，也不弹失败提示。
@@ -952,6 +959,96 @@ export default class HugoExporterPlugin extends Plugin {
     const text = `Hugo 推送完成：${this.config.gitRemote}/${this.config.gitBranch} · ${commitMessage}`;
     showMessage(text);
     return { ok: true, text };
+  }
+
+  /**
+   * persistOptionRename 把候选库里 oldName → newName，并联动 lastForms 中所有 docId 的对应字段。
+   * 输入：字段 key、旧值、新值。
+   */
+  private async persistOptionRename(
+    key: "categories" | "tags" | "collections",
+    oldName: string,
+    newName: string,
+  ): Promise<void> {
+    if (!oldName || !newName || oldName === newName) return;
+    const fieldKey =
+      key === "categories" ? "categoryOptions" : key === "tags" ? "tagOptions" : "collectionOptions";
+
+    const renamed: string[] = [];
+    let changed = false;
+    for (const item of this.config[fieldKey]) {
+      if (item === oldName) {
+        if (!renamed.includes(newName)) renamed.push(newName);
+        changed = true;
+      } else if (!renamed.includes(item)) {
+        renamed.push(item);
+      }
+    }
+    if (!changed) return;
+    this.config = { ...this.config, [fieldKey]: renamed };
+
+    // 联动更新 lastForms：每个 docId 下的同字段已选中值也要把 oldName 改成 newName。
+    const updatedForms: Record<string, Record<string, unknown>> = {};
+    for (const [docId, form] of Object.entries(this.lastForms)) {
+      const value = form[key];
+      if (Array.isArray(value)) {
+        const next: string[] = [];
+        for (const v of value) {
+          const replaced = v === oldName ? newName : v;
+          if (typeof replaced === "string" && !next.includes(replaced)) next.push(replaced);
+        }
+        updatedForms[docId] = { ...form, [key]: next };
+      } else {
+        updatedForms[docId] = form;
+      }
+    }
+    this.lastForms = updatedForms;
+
+    try {
+      await Promise.all([
+        this.saveData(STORAGE_NAME, this.config),
+        this.saveData(STORAGE_LAST_FORM, this.lastForms),
+      ]);
+      console.log(`[hugo-exporter] renamed ${key}: ${oldName} -> ${newName}`);
+    } catch (error) {
+      console.warn(`[hugo-exporter] rename ${key} persist failed`, error);
+    }
+  }
+
+  /**
+   * persistOptionDelete 从候选库永久删除某项；联动 lastForms 中所有 docId 的对应字段（取消该值）。
+   */
+  private async persistOptionDelete(
+    key: "categories" | "tags" | "collections",
+    name: string,
+  ): Promise<void> {
+    if (!name) return;
+    const fieldKey =
+      key === "categories" ? "categoryOptions" : key === "tags" ? "tagOptions" : "collectionOptions";
+    const next = this.config[fieldKey].filter((item) => item !== name);
+    if (next.length === this.config[fieldKey].length) return;
+    this.config = { ...this.config, [fieldKey]: next };
+
+    const updatedForms: Record<string, Record<string, unknown>> = {};
+    for (const [docId, form] of Object.entries(this.lastForms)) {
+      const value = form[key];
+      if (Array.isArray(value)) {
+        updatedForms[docId] = { ...form, [key]: value.filter((v) => v !== name) };
+      } else {
+        updatedForms[docId] = form;
+      }
+    }
+    this.lastForms = updatedForms;
+
+    try {
+      await Promise.all([
+        this.saveData(STORAGE_NAME, this.config),
+        this.saveData(STORAGE_LAST_FORM, this.lastForms),
+      ]);
+      console.log(`[hugo-exporter] deleted ${key}: ${name}`);
+    } catch (error) {
+      console.warn(`[hugo-exporter] delete ${key} persist failed`, error);
+    }
   }
 
   /** unionStrings 合并两个字符串数组，去重去空白，保留前一个数组的顺序优先。 */
