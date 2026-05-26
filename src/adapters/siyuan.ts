@@ -39,16 +39,38 @@ function ensureSuccess(response: ApiLikeResponse, action: string): void {
   }
 }
 
+/**
+ * NoActiveDocumentError 是"思源里没有打开任何文档"这一业务级错误的专属类。
+ * runExport 捕获时会识别它并给出友好的中文提示，而不是走通用错误堆栈。
+ */
+export class NoActiveDocumentError extends Error {
+  constructor(message = "未找到活动思源文档，请先在思源里打开一篇文档再点导出。") {
+    super(message);
+    this.name = "NoActiveDocumentError";
+  }
+}
+
 /** getActiveDocumentId 从当前活动编辑器中取根文档 ID。 */
 export function getActiveDocumentId(): string {
   const editor = getActiveEditor();
   const docId = editor?.protyle?.block?.rootID ?? editor?.protyle?.block?.id;
 
   if (!docId) {
-    throw new Error("No active SiYuan document found");
+    throw new NoActiveDocumentError();
   }
 
   return docId;
+}
+
+/** hasActiveDocument 仅检查是否能拿到活动文档 ID，不抛错。用于 runExport 前置校验。 */
+export function hasActiveDocument(): boolean {
+  try {
+    const editor = getActiveEditor();
+    const docId = editor?.protyle?.block?.rootID ?? editor?.protyle?.block?.id;
+    return Boolean(docId);
+  } catch {
+    return false;
+  }
 }
 
 /**

@@ -11,7 +11,7 @@
 import { confirm, Menu, Plugin, Setting, showMessage } from "siyuan";
 import { copyExportedAssets, writeExportedIndex } from "./adapters/fs";
 import { exportPushBundle, resolveGitBinary, verifyGitRepository } from "./adapters/git";
-import { readCurrentDocumentSnapshot } from "./adapters/siyuan";
+import { hasActiveDocument, NoActiveDocumentError, readCurrentDocumentSnapshot } from "./adapters/siyuan";
 import {
   DEFAULT_PLUGIN_CONFIG,
   type HugoExporterConfig,
@@ -83,7 +83,7 @@ function stringifyOptions(options: string[]): string {
  * 当前版本提供：自定义顶栏图标 + 合并导出入口 + 配置页 + dry-run / 正式导出。
  */
 export default class HugoExporterPlugin extends Plugin {
-  private static readonly VERSION = "0.2.0";
+  private static readonly VERSION = "0.2.1";
   private config: HugoExporterConfig = DEFAULT_PLUGIN_CONFIG;
   /** lastForms 是按 docId 缓存的最近一次表单填写值，用于 B6 表单字段记忆。 */
   private lastForms: Record<string, Record<string, unknown>> = {};
@@ -546,6 +546,14 @@ export default class HugoExporterPlugin extends Plugin {
     let progress: ProgressDialog | null = null;
     let stage: "snapshot" | "editor" | "plan" | "write" | "assets" | "git" = "snapshot";
     let stagePath = "";
+
+    // NOTE: 在抓快照之前先做轻量校验：思源里没有打开文档时直接给友好提示，
+    //       不走整个 stage=snapshot 错误链路（避免出现 "Hugo 导出异常（snapshot）：..." 这种唬人栈）。
+    if (!hasActiveDocument()) {
+      showMessage("请先在思源里打开一篇文档（点击文档树里的笔记），再点「导出当前文档」。");
+      return;
+    }
+
     try {
       stage = "snapshot";
       const doc = await readCurrentDocumentSnapshot();
@@ -701,9 +709,22 @@ export default class HugoExporterPlugin extends Plugin {
         progress.setActionButton({ label: "仅重试推送", onClick: () => void retry() });
       }
     } catch (error) {
+      // NOTE: NoActiveDocumentError 是业务级"未开文档"错误，给极简友好提示，不进度对话框。
+      if (error instanceof NoActiveDocumentError) {
+        showMessage(error.message);
+        return;
+      }
       const message = error instanceof Error ? error.message : "未知错误";
       // NOTE: B3 — 错误信息附加阶段与路径，避免魔尊看不到具体哪个文件失败。
-      const decoratedMessage = `Hugo 导出异常（${stage}${stagePath ? ` ${stagePath}` : ""}）：${message}`;
+      const stageLabel: Record<typeof stage, string> = {
+        snapshot: "读取思源文档",
+        editor: "打开导出编辑器",
+        plan: "生成导出计划",
+        write: "写入 index.md",
+        assets: "复制资源",
+        git: "推送 Git",
+      };
+      const decoratedMessage = `Hugo 导出失败（${stageLabel[stage]}${stagePath ? ` · ${stagePath}` : ""}）：${message}`;
       showMessage(decoratedMessage);
       if (progress) {
         progress.appendLog(`[error ${stage}] ${stagePath ? `${stagePath} · ` : ""}${message}`);
