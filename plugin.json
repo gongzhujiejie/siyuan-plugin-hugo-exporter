@@ -1,0 +1,23 @@
+{
+  "name": "siyuan-plugin-hugo-exporter",
+  "author": "lpppp",
+  "url": "https://github.com/gongzhujiejie/siyuan-plugin-hugo-exporter",
+  "version": "0.1.9",
+  "main": "index.js",
+  "minAppVersion": "3.0.0",
+  "backends": ["all"],
+  "frontends": ["all"],
+  "displayName": {
+    "default": "Hugo Exporter",
+    "zh_CN": "Hugo 导出器"
+  },
+  "description": {
+    "default": "Export the active SiYuan document as a Hugo leaf bundle.",
+    "zh_CN": "将当前思源文档导出为 Hugo leaf bundle。"
+  },
+  "readme": {
+    "default": "README.md",
+    "zh_CN": "README.md"
+  },
+  "keywords": ["hugo", "export", "blog", "markdown"]
+}
