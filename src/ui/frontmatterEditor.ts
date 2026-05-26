@@ -356,24 +356,40 @@ function createSelectableArrayInput(
 
       const chip = document.createElement("button");
       chip.type = "button";
-      chip.className = active ? "b3-button b3-button--text" : "b3-button b3-button--outline";
-      chip.style.cssText = "padding:2px 8px;font-size:12px;border-radius:6px 0 0 6px";
-      chip.textContent = active ? `${option} ✓` : option;
-      chip.title = "点击切换选中";
+      // NOTE: 选中 vs 未选中视觉拉到极致——避免魔尊误以为所有 chip 都已写入 frontmatter。
+      //       未选中：透明底 + 灰字 + 虚线边框；选中：实色高亮 + 加粗 + ✓ 前缀。
+      if (active) {
+        chip.className = "b3-button b3-button--text";
+        chip.style.cssText =
+          "padding:3px 10px;font-size:12px;border-radius:6px 0 0 6px;font-weight:600;" +
+          "background:var(--b3-theme-primary);color:#fff;border:1px solid var(--b3-theme-primary)";
+        chip.textContent = `✓ ${option}`;
+        chip.title = "已选中：会写入 frontmatter。点击取消选中。";
+      } else {
+        chip.className = "b3-button b3-button--cancel";
+        chip.style.cssText =
+          "padding:3px 10px;font-size:12px;border-radius:6px 0 0 6px;" +
+          "background:transparent;color:var(--b3-theme-on-surface-light);" +
+          "border:1px dashed var(--b3-border-color);opacity:.7";
+        chip.textContent = option;
+        chip.title = "未选中：仅候选项，不会写入 frontmatter。点击选中。";
+      }
       chip.addEventListener("click", () => {
         selected = toggleArrayValue(selected, option);
         renderChips();
       });
       chipWrap.appendChild(chip);
 
-      // 仅"在候选库里的项"才显示管理按钮；本次临时新加的（还没 saveData）不显示，
-      // 一是避免对未保存的项重命名引起混乱，二是让 UI 直观区分"持久 vs 临时"。
+      // 仅"在候选库里的项"才显示管理按钮；本次临时新加的（还没 saveData）不显示。
       if (isManaged && (onRenameOption || onDeleteOption)) {
         const gear = document.createElement("button");
         gear.type = "button";
         gear.className = "b3-button b3-button--outline";
         gear.style.cssText =
-          "padding:2px 6px;font-size:11px;border-left:1px dashed var(--b3-border-color);border-radius:0 6px 6px 0;cursor:pointer";
+          "padding:3px 6px;font-size:11px;border-left:none;border-radius:0 6px 6px 0;cursor:pointer;" +
+          (active
+            ? "background:var(--b3-theme-primary);color:#fff;border:1px solid var(--b3-theme-primary);border-left:1px solid rgba(255,255,255,.4)"
+            : "background:transparent;color:var(--b3-theme-on-surface-light);border:1px dashed var(--b3-border-color);border-left:none;opacity:.7");
         gear.textContent = "⋯";
         gear.title = "管理候选项：重命名 / 删除";
         gear.addEventListener("click", (event) => {
@@ -610,6 +626,23 @@ export function openFrontmatterEditor(
     dryRunRow.appendChild(dryRunHint);
     scroll.appendChild(dryRunRow);
 
+    // NOTE: 实际写入 frontmatter 预览面板（v0.2.5 新增）。
+    //       只展示真正会写进 index.md 的字段（含数组的"已选中"项）。
+    //       目的：让魔尊一眼看出"灰 chip 是候选库、不会写入"，避免误以为所有 chip 都被记录。
+    const previewBox = document.createElement("details");
+    previewBox.style.cssText =
+      "padding:6px 10px;border-radius:6px;background:var(--b3-theme-surface);font-size:12px;color:var(--b3-theme-on-surface);line-height:1.6";
+    previewBox.open = true; // 默认展开，让魔尊立刻看到"实际写入"
+    const previewSummary = document.createElement("summary");
+    previewSummary.style.cssText = "cursor:pointer;font-weight:600";
+    previewSummary.textContent = "实际写入 frontmatter（仅这些会进文章）";
+    const previewBody = document.createElement("pre");
+    previewBody.style.cssText =
+      "margin:6px 0 0;padding:8px;background:var(--b3-theme-background);border-radius:4px;font-size:11.5px;font-family:Consolas, Monaco, monospace;white-space:pre-wrap;word-break:break-all;max-height:140px;overflow:auto";
+    previewBox.appendChild(previewSummary);
+    previewBox.appendChild(previewBody);
+    scroll.appendChild(previewBox);
+
     const commonSection = createSection(scroll, "常用字段", false);
     const commonRows = fieldGroups.common.map((field) =>
       createFieldRow(commonSection, field, initial[field.key], editorOptions),
@@ -620,6 +653,55 @@ export function openFrontmatterEditor(
       createFieldRow(advancedSection, field, initial[field.key], editorOptions),
     );
     const fieldRows: FieldRow[] = [...commonRows, ...advancedRows];
+
+    /**
+     * refreshPreview 收集当前所有字段值，渲染成"实际会写入 frontmatter"的预览。
+     * - 数组字段只显示已选中项（与 confirm 时写入逻辑一致）；
+     * - 空字符串 / 空数组 / undefined 字段会被丢弃，与 submit 行为一致；
+     * - 用 YAML 风格渲染，让魔尊看到的就是磁盘上 index.md 顶部那段。
+     */
+    const refreshPreview = (): void => {
+      const lines: string[] = [];
+      for (const row of fieldRows) {
+        let value: unknown;
+        try {
+          value = row.read();
+        } catch {
+          continue;
+        }
+        const isEmptyArray = Array.isArray(value) && value.length === 0 && !row.field.required;
+        if (value === undefined || value === "" || isEmptyArray) continue;
+
+        if (Array.isArray(value)) {
+          if (value.length === 0) continue;
+          lines.push(`${row.field.key}:`);
+          for (const item of value) {
+            lines.push(`  - ${String(item)}`);
+          }
+        } else if (typeof value === "boolean") {
+          lines.push(`${row.field.key}: ${value}`);
+        } else if (typeof value === "object" && value !== null) {
+          lines.push(`${row.field.key}: ${JSON.stringify(value)}`);
+        } else {
+          lines.push(`${row.field.key}: ${String(value)}`);
+        }
+      }
+      // 永远把 title/date/lastmod 在最前面提示一下（实际写入时也会有这些）
+      const head = [
+        `title: ${doc.title}`,
+        `date: ${doc.createdAt}`,
+        `lastmod: ${doc.updatedAt}`,
+      ];
+      previewBody.textContent = ["---", ...head, ...lines, "---"].join("\n");
+    };
+
+    // 字段变化（输入 / 切换 chip / 改 textarea）都刷新预览。
+    // capture 阶段监听，确保 chip 内部 click → renderChips → 也能触发；
+    // 用 setTimeout(0) 避开 chip click handler 内部对 selected 的赋值时序。
+    scroll.addEventListener("input", () => setTimeout(refreshPreview, 0), true);
+    scroll.addEventListener("change", () => setTimeout(refreshPreview, 0), true);
+    scroll.addEventListener("click", () => setTimeout(refreshPreview, 0), true);
+    refreshPreview();
 
     // NOTE: B7 — 三个按钮说明默认折叠成 details，老用户不被打扰；新用户点开仍能看到。
     const buttonsHelp = document.createElement("details");
