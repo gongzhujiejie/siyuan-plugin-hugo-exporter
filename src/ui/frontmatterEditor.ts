@@ -65,6 +65,11 @@ export interface FrontmatterEditorOptions {
   /** gitRemote 与 gitBranch 仅用于按钮 hover 提示，让魔尊一眼看到推送目标。 */
   gitRemote: string;
   gitBranch: string;
+  /**
+   * lastValues 是上一次导出本文档（按 docId）填过的字段值，覆盖 preset/YAML 默认。
+   * title/date/lastmod 永远从思源文档实时取，不会被 lastValues 覆盖。
+   */
+  lastValues?: Record<string, unknown>;
 }
 
 interface FieldRow {
@@ -111,9 +116,22 @@ function createRowShell(form: HTMLElement, field: FrontmatterFieldConfig): { ite
 function createSelectableArrayInput(valueBox: HTMLElement, initialValue: unknown, configuredOptions: string[]): () => string[] {
   let selected = parseArrayInput(stringifyArray(initialValue));
   let options = mergeOptionValues(configuredOptions, selected);
+  let filterText = "";
 
   const chips = document.createElement("div");
-  chips.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px";
+  // NOTE: chip 区超过 96px 自动滚动，避免候选过多撑爆表单（B8）。
+  chips.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px;max-height:120px;overflow:auto;padding:2px";
+
+  // NOTE: 候选过多时，提供一个搜索输入框做实时过滤；少时不显示，保持界面简洁。
+  const filterInput = document.createElement("input");
+  filterInput.type = "text";
+  filterInput.className = "b3-text-field fn__block";
+  filterInput.placeholder = "在候选中过滤…";
+  filterInput.style.cssText = "margin-bottom:6px;font-size:12px";
+  filterInput.addEventListener("input", () => {
+    filterText = filterInput.value.trim().toLowerCase();
+    renderChips();
+  });
 
   const inputRow = document.createElement("div");
   inputRow.style.cssText = "display:flex;gap:6px";
@@ -121,7 +139,7 @@ function createSelectableArrayInput(valueBox: HTMLElement, initialValue: unknown
   const customInput = document.createElement("input");
   customInput.type = "text";
   customInput.className = "b3-text-field fn__block";
-  customInput.placeholder = "输入后回车或点 +，用于本次导出";
+  customInput.placeholder = "新建：回车 / 点 + / 用逗号一次输多个";
 
   const addButton = document.createElement("button");
   addButton.type = "button";
@@ -131,6 +149,9 @@ function createSelectableArrayInput(valueBox: HTMLElement, initialValue: unknown
 
   inputRow.appendChild(customInput);
   inputRow.appendChild(addButton);
+  if (configuredOptions.length > 12 || options.length > 12) {
+    valueBox.appendChild(filterInput);
+  }
   valueBox.appendChild(chips);
   valueBox.appendChild(inputRow);
 
@@ -144,7 +165,19 @@ function createSelectableArrayInput(valueBox: HTMLElement, initialValue: unknown
       return;
     }
 
-    for (const option of options) {
+    const visible = filterText
+      ? options.filter((option) => option.toLowerCase().includes(filterText))
+      : options;
+
+    if (visible.length === 0) {
+      const empty = document.createElement("span");
+      empty.style.cssText = "color:var(--b3-theme-on-surface-light);font-size:12px";
+      empty.textContent = `没有匹配 "${filterText}" 的候选；可点 + 直接新增。`;
+      chips.appendChild(empty);
+      return;
+    }
+
+    for (const option of visible) {
       const active = selected.includes(option);
       const chip = document.createElement("button");
       chip.type = "button";
@@ -223,7 +256,9 @@ function createFieldRow(
     const isLong = field.key === "description" || field.key === "summary";
     const input = isLong ? document.createElement("textarea") : document.createElement("input");
     if (input instanceof HTMLTextAreaElement) {
-      input.rows = 2;
+      // NOTE: B10 — 长文本字段默认 4 行，并允许垂直手动拉大；不影响其他字段。
+      input.rows = 4;
+      input.style.resize = "vertical";
     } else {
       input.type = field.key === "password" ? "password" : "text";
     }
@@ -276,15 +311,20 @@ export function openFrontmatterEditor(
         const parsed = yaml.load(defaultsYaml);
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
           initial = { ...initial, ...(parsed as Record<string, unknown>) };
-          // NOTE: title/date/lastmod 永远从思源文档实时取，避免被默认 YAML 覆盖。
-          initial.title = doc.title;
-          initial.date = doc.createdAt;
-          initial.lastmod = doc.updatedAt;
         }
       } catch (error) {
         console.warn("[hugo-exporter] parse defaultFrontmatterYaml failed", error);
       }
     }
+
+    // NOTE: B6 — 上次导出该文档时填过的字段优先级最高（覆盖 preset / YAML 默认），
+    //       但 title / date / lastmod 永远从思源文档实时取。
+    if (editorOptions?.lastValues) {
+      initial = { ...initial, ...editorOptions.lastValues };
+    }
+    initial.title = doc.title;
+    initial.date = doc.createdAt;
+    initial.lastmod = doc.updatedAt;
 
     const fieldGroups = splitFrontmatterFields(FIXIT_BLOG_PRESET.frontmatterFields);
     let resolved = false;
@@ -294,8 +334,13 @@ export function openFrontmatterEditor(
       resolve(value);
     };
 
+    // NOTE: 整体布局拆成"可滚内容 scroll + 不滚按钮 buttonBar"两层，避免 B1：按钮被滚出视野。
     const root = document.createElement("div");
-    root.style.cssText = "padding:16px 18px;display:flex;flex-direction:column;gap:8px;max-height:76vh;overflow:auto";
+    root.style.cssText = "display:flex;flex-direction:column;max-height:78vh";
+
+    const scroll = document.createElement("div");
+    scroll.style.cssText = "padding:16px 18px 12px;display:flex;flex-direction:column;gap:8px;overflow:auto;flex:1 1 auto";
+    root.appendChild(scroll);
 
     const slugRow = document.createElement("div");
     slugRow.style.cssText = "margin-bottom:4px;display:flex;align-items:center;gap:12px";
@@ -310,12 +355,12 @@ export function openFrontmatterEditor(
     slugInput.style.cssText = "flex:1 1 auto";
     slugRow.appendChild(slugLabel);
     slugRow.appendChild(slugInput);
-    root.appendChild(slugRow);
+    scroll.appendChild(slugRow);
 
     const targetPreview = document.createElement("div");
     targetPreview.style.cssText =
       "padding:6px 8px;border-radius:6px;background:var(--b3-theme-surface);font-size:12px;color:var(--b3-theme-on-surface);word-break:break-all";
-    root.appendChild(targetPreview);
+    scroll.appendChild(targetPreview);
 
     const dryRunRow = document.createElement("label");
     dryRunRow.style.cssText = "margin-bottom:8px;display:flex;align-items:center;gap:12px;cursor:pointer";
@@ -332,35 +377,51 @@ export function openFrontmatterEditor(
     dryRunRow.appendChild(dryRunLabel);
     dryRunRow.appendChild(dryRunInput);
     dryRunRow.appendChild(dryRunHint);
-    root.appendChild(dryRunRow);
+    scroll.appendChild(dryRunRow);
 
-    const commonSection = createSection(root, "常用字段", false);
+    const commonSection = createSection(scroll, "常用字段", false);
     const commonRows = fieldGroups.common.map((field) =>
       createFieldRow(commonSection, field, initial[field.key], editorOptions),
     );
 
-    const advancedSection = createSection(root, "高级字段", true);
+    const advancedSection = createSection(scroll, "高级字段", true);
     const advancedRows = fieldGroups.advanced.map((field) =>
       createFieldRow(advancedSection, field, initial[field.key], editorOptions),
     );
     const fieldRows: FieldRow[] = [...commonRows, ...advancedRows];
 
-    const buttonsHelp = document.createElement("div");
+    // NOTE: B7 — 三个按钮说明默认折叠成 details，老用户不被打扰；新用户点开仍能看到。
+    const buttonsHelp = document.createElement("details");
     buttonsHelp.style.cssText =
-      "padding:8px 10px;border-radius:6px;background:var(--b3-theme-surface);font-size:12px;color:var(--b3-theme-on-surface-light);line-height:1.6";
-    buttonsHelp.innerHTML = [
-      "<b>三个按钮怎么选：</b>",
-      "• <b>取消</b>：放弃本次操作，不写入任何文件。",
-      "• <b>预览导出</b>（勾选「仅预览」时显示）：只生成路径与资源计划，不写文件、不推送，用于核对。",
-      "• <b>导出并写入</b>（取消勾选「仅预览」时显示）：写 index.md 和 images，仅写本地，不推送。",
+      "padding:6px 10px;border-radius:6px;background:var(--b3-theme-surface);font-size:12px;color:var(--b3-theme-on-surface-light);line-height:1.6";
+    const buttonsHelpSummary = document.createElement("summary");
+    buttonsHelpSummary.style.cssText = "cursor:pointer;font-weight:600;color:var(--b3-theme-on-surface)";
+    buttonsHelpSummary.textContent = "三个按钮怎么选？";
+    const buttonsHelpBody = document.createElement("div");
+    buttonsHelpBody.style.cssText = "margin-top:4px";
+    const helpLines = [
+      "• 取消：放弃本次操作，不写入任何文件。",
+      "• 预览导出（勾选「仅预览」时显示）：只生成路径与资源计划，不写文件、不推送，用于核对。",
+      "• 导出并写入（取消勾选「仅预览」时显示）：写 index.md 和 images，仅写本地，不推送。",
       editorOptions?.gitEnabled
-        ? "• <b>导出并推送</b>（取消勾选「仅预览」且启用 Git 推送时显示）：写本地后自动 git add → commit → push，触发 GitHub Actions 部署。"
-        : "• <b>导出并推送</b>：当前在设置里被关闭，开启「启用 Git 推送」后会出现。",
-    ].join("<br>");
-    root.appendChild(buttonsHelp);
+        ? "• 导出并推送（取消勾选「仅预览」且启用 Git 推送时显示）：写本地后自动 git add → commit → push，触发 GitHub Actions 部署。"
+        : "• 导出并推送：当前在设置里被关闭，开启「启用 Git 推送」后会出现。",
+      "",
+      "快捷键：Ctrl+Enter 提交（写入或预览），Ctrl+Shift+Enter 推送，Esc 取消。",
+    ];
+    for (const line of helpLines) {
+      const node = document.createElement("div");
+      node.textContent = line;
+      buttonsHelpBody.appendChild(node);
+    }
+    buttonsHelp.appendChild(buttonsHelpSummary);
+    buttonsHelp.appendChild(buttonsHelpBody);
+    scroll.appendChild(buttonsHelp);
 
+    // NOTE: B1 — 按钮栏放在 root 末尾，紧贴 dialog 底部不滚动；与 scroll 区有 1px 上边线分割。
     const buttonBar = document.createElement("div");
-    buttonBar.style.cssText = "display:flex;justify-content:flex-end;gap:8px;padding-top:8px";
+    buttonBar.style.cssText =
+      "display:flex;justify-content:flex-end;gap:8px;padding:10px 18px;border-top:1px solid var(--b3-border-color);background:var(--b3-theme-background);flex:0 0 auto";
     const cancelBtn = document.createElement("button");
     cancelBtn.className = "b3-button b3-button--cancel";
     cancelBtn.textContent = "取消";
@@ -370,8 +431,9 @@ export function openFrontmatterEditor(
     pushBtn.className = "b3-button b3-button--text";
     pushBtn.textContent = "导出并推送";
     if (editorOptions?.gitEnabled) {
-      pushBtn.title = `推送到 ${editorOptions.gitRemote}/${editorOptions.gitBranch}`;
+      pushBtn.title = `推送到 ${editorOptions.gitRemote}/${editorOptions.gitBranch} · 快捷键 Ctrl+Shift+Enter`;
     }
+    confirmBtn.title = "Ctrl+Enter";
     buttonBar.appendChild(cancelBtn);
     buttonBar.appendChild(confirmBtn);
     if (editorOptions?.gitEnabled) {
@@ -453,5 +515,16 @@ export function openFrontmatterEditor(
 
     confirmBtn.addEventListener("click", () => submit(false));
     pushBtn.addEventListener("click", () => submit(true));
+
+    // NOTE: B9 — 键盘快捷键。Ctrl/Cmd+Enter 提交（按当前 dry-run 状态），
+    //       Ctrl/Cmd+Shift+Enter 直接推送（仅在启用 git 且非 dry-run 时生效）。
+    //       绑定到 dialog.element 上以便整个弹窗内任意焦点都能触发。
+    dialog.element.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter") return;
+      if (!event.ctrlKey && !event.metaKey) return;
+      event.preventDefault();
+      const wantPush = event.shiftKey && !!editorOptions?.gitEnabled && !dryRunInput.checked;
+      submit(wantPush);
+    });
   });
 }

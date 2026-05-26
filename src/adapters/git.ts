@@ -169,8 +169,19 @@ function getSpawn(): SpawnFn {
  */
 export async function runGit(options: GitRunOptions): Promise<GitCommandResult> {
   return new Promise((resolveResult) => {
-    let stdout = "";
-    let stderr = "";
+    // NOTE: C5 — 先收 Buffer，最后整体解码；避免按 chunk 解 utf8 导致多字节字符被切断。
+    //       默认 utf8（git 自身、GitHub 远端、绝大多数 push 输出都是 utf8）；
+    //       若日后用户报告 Windows 中文版 git 乱码，可在此处接入第三方解码库。
+    const stdoutChunks: Uint8Array[] = [];
+    const stderrChunks: Uint8Array[] = [];
+    const decode = (chunks: Uint8Array[]): string => {
+      if (chunks.length === 0) return "";
+      try {
+        return Buffer.concat(chunks).toString("utf8");
+      } catch {
+        return chunks.map((chunk) => Buffer.from(chunk).toString("utf8")).join("");
+      }
+    };
 
     let child;
     try {
@@ -194,17 +205,18 @@ export async function runGit(options: GitRunOptions): Promise<GitCommandResult> 
     }
 
     child.stdout?.on("data", (chunk) => {
-      stdout += chunk.toString("utf8");
+      stdoutChunks.push(chunk as Uint8Array);
     });
     child.stderr?.on("data", (chunk) => {
-      stderr += chunk.toString("utf8");
+      stderrChunks.push(chunk as Uint8Array);
     });
     child.on("error", (error) => {
+      const stderr = decode(stderrChunks);
       resolveResult({
         ok: false,
         command: options.binary,
         args: options.args,
-        stdout,
+        stdout: decode(stdoutChunks),
         stderr: stderr || error.message,
         exitCode: null,
       });
@@ -214,8 +226,8 @@ export async function runGit(options: GitRunOptions): Promise<GitCommandResult> 
         ok: code === 0,
         command: options.binary,
         args: options.args,
-        stdout,
-        stderr,
+        stdout: decode(stdoutChunks),
+        stderr: decode(stderrChunks),
         exitCode: code,
       });
     });

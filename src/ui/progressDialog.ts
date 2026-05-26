@@ -1,13 +1,13 @@
 /**
  * 文件用途：导出 / 推送过程中向魔尊展示分步进度的对话框。
  * 创建日期：2026-05-25
- * 修改日期：2026-05-25
+ * 修改日期：2026-05-26
  * 语言版本：TypeScript 5.x
  * 依赖库：siyuan
  *
  * 安全说明：所有步骤标题和详情用 textContent 写入 DOM，避免日志中包含 HTML 时被解释执行。
  */
-import { Dialog } from "siyuan";
+import { Dialog, showMessage } from "siyuan";
 
 /** ProgressStatus 描述每个步骤当前的状态。 */
 export type ProgressStatus = "pending" | "running" | "ok" | "warn" | "fail";
@@ -28,6 +28,11 @@ export interface ProgressDialog {
   appendLog(line: string): void;
   /** finalize 标记整体结果，启用「关闭」按钮；不会自动关闭，方便魔尊看完。 */
   finalize(success: boolean, summary: string): void;
+  /**
+   * setActionButton 在底部按钮栏额外加一个动作按钮（例如"仅重试推送"）。
+   * 多次调用会替换上一次的按钮。传 null/undefined 隐藏按钮。
+   */
+  setActionButton(action: { label: string; onClick: () => void } | null): void;
   /** destroy 立即关闭对话框，仅在调用方需要时使用。 */
   destroy(): void;
 }
@@ -54,24 +59,48 @@ const STATUS_COLOR: Record<ProgressStatus, string> = {
  * 返回：可被外部按步推进的 ProgressDialog 句柄。
  */
 export function openProgressDialog(title: string): ProgressDialog {
+  // NOTE: 与 frontmatter 弹窗一致，拆 scroll + sticky-footer 两层；步骤再多按钮也不会被埋。
   const root = document.createElement("div");
-  root.style.cssText = "padding:16px 18px;display:flex;flex-direction:column;gap:10px;max-height:70vh;overflow:auto";
+  root.style.cssText = "display:flex;flex-direction:column;max-height:78vh";
+
+  const scroll = document.createElement("div");
+  scroll.style.cssText =
+    "padding:16px 18px 12px;display:flex;flex-direction:column;gap:10px;overflow:auto;flex:1 1 auto";
+  root.appendChild(scroll);
 
   const stepsBox = document.createElement("div");
   stepsBox.style.cssText = "display:flex;flex-direction:column;gap:6px";
-  root.appendChild(stepsBox);
+  scroll.appendChild(stepsBox);
+
+  // NOTE: B5 — 日志区头部带"复制日志"按钮，长 stderr 一键复制反馈。
+  const logHeader = document.createElement("div");
+  logHeader.style.cssText =
+    "display:none;justify-content:space-between;align-items:center;font-size:12px;color:var(--b3-theme-on-surface-light)";
+  const logTitle = document.createElement("span");
+  logTitle.textContent = "执行日志";
+  const copyLogBtn = document.createElement("button");
+  copyLogBtn.type = "button";
+  copyLogBtn.className = "b3-button b3-button--outline";
+  copyLogBtn.textContent = "复制日志";
+  copyLogBtn.style.cssText = "padding:2px 10px;font-size:12px";
+  logHeader.appendChild(logTitle);
+  logHeader.appendChild(copyLogBtn);
+  scroll.appendChild(logHeader);
 
   const logBox = document.createElement("pre");
   logBox.style.cssText =
-    "margin:0;padding:8px;background:var(--b3-theme-surface);border-radius:6px;font-size:12px;white-space:pre-wrap;word-break:break-all;max-height:160px;overflow:auto;display:none";
-  root.appendChild(logBox);
+    "margin:0;padding:8px;background:var(--b3-theme-surface);border-radius:6px;font-size:12px;white-space:pre-wrap;word-break:break-all;max-height:200px;overflow:auto;display:none";
+  scroll.appendChild(logBox);
 
   const summaryBox = document.createElement("div");
   summaryBox.style.cssText = "font-weight:600";
-  root.appendChild(summaryBox);
+  scroll.appendChild(summaryBox);
 
   const buttonBar = document.createElement("div");
-  buttonBar.style.cssText = "display:flex;justify-content:flex-end;gap:8px;padding-top:4px";
+  buttonBar.style.cssText =
+    "display:flex;justify-content:flex-end;gap:8px;padding:10px 18px;border-top:1px solid var(--b3-border-color);background:var(--b3-theme-background);flex:0 0 auto";
+  // 占位：动作按钮（例如"仅重试推送"），默认隐藏，failure 时由调用方注入。
+  let actionBtn: HTMLButtonElement | null = null;
   const closeBtn = document.createElement("button");
   closeBtn.className = "b3-button b3-button--text";
   closeBtn.textContent = "执行中…";
@@ -82,7 +111,7 @@ export function openProgressDialog(title: string): ProgressDialog {
   const dialog = new Dialog({
     title,
     content: '<div id="hugo-progress-dialog"></div>',
-    width: "560px",
+    width: "620px",
     height: "auto",
   });
 
@@ -90,6 +119,36 @@ export function openProgressDialog(title: string): ProgressDialog {
   if (mountPoint) mountPoint.appendChild(root);
 
   closeBtn.addEventListener("click", () => dialog.destroy());
+
+  copyLogBtn.addEventListener("click", () => {
+    const text = logBox.textContent ?? "";
+    if (!text) {
+      showMessage("当前没有可复制的日志");
+      return;
+    }
+    if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+      void navigator.clipboard.writeText(text).then(
+        () => showMessage("日志已复制到剪贴板"),
+        () => showMessage("复制失败，请手动选中日志再 Ctrl+C"),
+      );
+    } else {
+      // NOTE: 旧浏览器/思源环境兜底：用临时 textarea + execCommand。
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand("copy");
+        showMessage("日志已复制到剪贴板");
+      } catch {
+        showMessage("复制失败，请手动选中日志再 Ctrl+C");
+      } finally {
+        document.body.removeChild(ta);
+      }
+    }
+  });
 
   const stepRows = new Map<string, { row: HTMLElement; icon: HTMLElement; label: HTMLElement; detail: HTMLElement }>();
 
@@ -140,8 +199,11 @@ export function openProgressDialog(title: string): ProgressDialog {
       }
     },
     appendLog(line) {
+      logHeader.style.display = "flex";
       logBox.style.display = "block";
-      logBox.textContent = (logBox.textContent ? `${logBox.textContent}\n` : "") + line;
+      // NOTE: 用 textNode 追加而非字符串拼接，避免 O(n²)。
+      const text = (logBox.textContent ?? "").length > 0 ? `\n${line}` : line;
+      logBox.appendChild(document.createTextNode(text));
       logBox.scrollTop = logBox.scrollHeight;
     },
     finalize(success, summary) {
@@ -149,6 +211,26 @@ export function openProgressDialog(title: string): ProgressDialog {
       summaryBox.style.color = success ? STATUS_COLOR.ok : STATUS_COLOR.fail;
       closeBtn.disabled = false;
       closeBtn.textContent = "关闭";
+      // NOTE: B5 — 失败时自动展开日志区，方便魔尊一眼看到 stderr。
+      if (!success && (logBox.textContent ?? "").length > 0) {
+        logHeader.style.display = "flex";
+        logBox.style.display = "block";
+      }
+    },
+    setActionButton(action) {
+      if (actionBtn) {
+        actionBtn.remove();
+        actionBtn = null;
+      }
+      if (!action) return;
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "b3-button b3-button--outline";
+      btn.textContent = action.label;
+      btn.addEventListener("click", () => action.onClick());
+      // 插入到 closeBtn 之前
+      buttonBar.insertBefore(btn, closeBtn);
+      actionBtn = btn;
     },
     destroy() {
       dialog.destroy();

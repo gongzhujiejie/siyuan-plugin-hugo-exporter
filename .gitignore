@@ -12,6 +12,7 @@ node_modules/
 # 构建产物
 dist/
 .release/
+package.zip
 
 # 测试与覆盖率
 coverage/

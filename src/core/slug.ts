@@ -75,11 +75,21 @@ export function validateSlug(slug: string): void {
 
 /**
  * assertNoTraversalPattern 在 slugify 前阻断明确路径穿越输入。
- * 这样普通标题里的斜杠仍会被安全转为短横线，但 ../../evil 会被拒绝。
+ *
+ * 关键点：必须按"路径段"判定 ".."，而不是整字符串 includes("..")。
+ * 否则正常标题如 "Hello..World" / "C++..Tips" / "version 2..3" 会被误杀。
+ *
+ * 安全语义：拒绝 "..", "../", "/..", "..\\", "\\..", 或独立的路径段 ".."；
+ *           合法标题里出现连字 ".." 不再触发。
  */
 function assertNoTraversalPattern(raw: string): void {
-  if (raw.includes("..") || raw.includes("/../") || raw.includes("\\..\\")) {
-    throw new Error(`Unsafe slug: ${raw}`);
+  // NOTE: 先把 \\ 统一成 /，再按 / 切段；任何一段恰好是 .. 或 . 即视为路径穿越。
+  const segments = raw.replaceAll("\\", "/").split("/");
+  for (const segment of segments) {
+    const trimmed = segment.trim();
+    if (trimmed === ".." || trimmed === ".") {
+      throw new Error(`Unsafe slug: ${raw}`);
+    }
   }
 }
 

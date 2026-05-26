@@ -89,3 +89,38 @@ describe("DEFAULT_PLUGIN_CONFIG git defaults", () => {
     expect(DEFAULT_PLUGIN_CONFIG.gitBinary).toBe("");
   });
 });
+
+describe("mergePluginConfig type guards", () => {
+  it("falls back to defaults when string fields are wrong type", () => {
+    const merged = mergePluginConfig({ repoRoot: 123 as unknown as string, gitBranch: null as unknown as string });
+    expect(merged.repoRoot).toBe(DEFAULT_PLUGIN_CONFIG.repoRoot);
+    expect(merged.gitBranch).toBe(DEFAULT_PLUGIN_CONFIG.gitBranch);
+  });
+
+  it("falls back to defaults when array fields are null/undefined/string", () => {
+    const merged = mergePluginConfig({
+      categoryOptions: null as unknown as string[],
+      tagOptions: undefined as unknown as string[],
+      collectionOptions: "MAZESEC" as unknown as string[],
+    });
+    expect(merged.categoryOptions).toEqual(DEFAULT_PLUGIN_CONFIG.categoryOptions);
+    expect(merged.tagOptions).toEqual(DEFAULT_PLUGIN_CONFIG.tagOptions);
+    expect(merged.collectionOptions).toEqual(DEFAULT_PLUGIN_CONFIG.collectionOptions);
+  });
+
+  it("filters non-string entries inside array fields", () => {
+    const merged = mergePluginConfig({
+      categoryOptions: ["MAZESEC", 123, null, "渗透"] as unknown as string[],
+    });
+    expect(merged.categoryOptions).toEqual(["MAZESEC", "渗透"]);
+  });
+
+  it("falls back to defaults when boolean fields are non-boolean", () => {
+    const merged = mergePluginConfig({
+      gitEnabled: "true" as unknown as boolean,
+      pullBeforePush: 1 as unknown as boolean,
+    });
+    expect(merged.gitEnabled).toBe(DEFAULT_PLUGIN_CONFIG.gitEnabled);
+    expect(merged.pullBeforePush).toBe(DEFAULT_PLUGIN_CONFIG.pullBeforePush);
+  });
+});

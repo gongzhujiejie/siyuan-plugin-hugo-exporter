@@ -68,13 +68,46 @@ export const DEFAULT_PLUGIN_CONFIG: HugoExporterConfig = {
 
 /**
  * mergePluginConfig 合并用户配置与默认值。
- * 输入：可能为空或字段缺失的配置对象。
- * 返回：字段完整的 HugoExporterConfig。
+ * 输入：可能为空、字段缺失或类型损坏的配置对象。
+ * 返回：字段完整、类型正确的 HugoExporterConfig；任何非法类型字段一律回退默认值。
+ *
+ * 安全说明：旧版 storage 文件可能因为外部编辑被破坏（例如某个数组字段被写成 null），
+ *           这里逐字段做类型守护，避免插件加载时 .join / .trim 等调用直接 NPE。
  */
 export function mergePluginConfig(input: Partial<HugoExporterConfig> | undefined): HugoExporterConfig {
+  const raw = (input ?? {}) as Record<string, unknown>;
+  const pickString = (key: keyof HugoExporterConfig): string => {
+    const value = raw[key as string];
+    return typeof value === "string" ? value : (DEFAULT_PLUGIN_CONFIG[key] as string);
+  };
+  const pickBool = (key: keyof HugoExporterConfig): boolean => {
+    const value = raw[key as string];
+    return typeof value === "boolean" ? value : (DEFAULT_PLUGIN_CONFIG[key] as boolean);
+  };
+  const pickStringArray = (key: keyof HugoExporterConfig): string[] => {
+    const value = raw[key as string];
+    if (Array.isArray(value)) {
+      return value.filter((item): item is string => typeof item === "string");
+    }
+    return DEFAULT_PLUGIN_CONFIG[key] as string[];
+  };
+
   return {
-    ...DEFAULT_PLUGIN_CONFIG,
-    ...(input ?? {}),
+    repoRoot: pickString("repoRoot"),
+    contentDir: pickString("contentDir"),
+    assetSubDir: pickString("assetSubDir"),
+    assetBasePath: pickString("assetBasePath"),
+    dryRunDefault: pickBool("dryRunDefault"),
+    defaultFrontmatterYaml: pickString("defaultFrontmatterYaml"),
+    categoryOptions: pickStringArray("categoryOptions"),
+    tagOptions: pickStringArray("tagOptions"),
+    collectionOptions: pickStringArray("collectionOptions"),
+    gitEnabled: pickBool("gitEnabled"),
+    gitBinary: pickString("gitBinary"),
+    gitRemote: pickString("gitRemote"),
+    gitBranch: pickString("gitBranch"),
+    commitMessageTemplate: pickString("commitMessageTemplate"),
+    pullBeforePush: pickBool("pullBeforePush"),
   };
 }
 

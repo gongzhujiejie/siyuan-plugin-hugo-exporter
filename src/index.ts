@@ -8,7 +8,7 @@
  * NOTE: 在 onload 中先 addIcons 再 addTopBar；Setting 必须在 onload 同步执行
  * 内部完成 addItem，否则思源集市卡片不会出现齿轮按钮。
  */
-import { Menu, Plugin, Setting, showMessage } from "siyuan";
+import { confirm, Menu, Plugin, Setting, showMessage } from "siyuan";
 import { copyExportedAssets, writeExportedIndex } from "./adapters/fs";
 import { exportPushBundle, resolveGitBinary, verifyGitRepository } from "./adapters/git";
 import { readCurrentDocumentSnapshot } from "./adapters/siyuan";
@@ -24,6 +24,12 @@ import { openFrontmatterEditor } from "./ui/frontmatterEditor";
 import { openProgressDialog, type ProgressDialog } from "./ui/progressDialog";
 
 const STORAGE_NAME = "hugo-exporter-config.json";
+
+/**
+ * STORAGE_LAST_FORM 缓存按文档 ID 的最近一次表单填写值，用于 B6 表单字段记忆。
+ * 结构：{ "<docId>": { categories: [...], tags: [...], description: "..." } }
+ */
+const STORAGE_LAST_FORM = "hugo-exporter-last-form.json";
 
 /**
  * HUGO_ICON_SVG 注册自定义图标。
@@ -77,8 +83,10 @@ function stringifyOptions(options: string[]): string {
  * 当前版本提供：自定义顶栏图标 + 合并导出入口 + 配置页 + dry-run / 正式导出。
  */
 export default class HugoExporterPlugin extends Plugin {
-  private static readonly VERSION = "0.1.9";
+  private static readonly VERSION = "0.2.0";
   private config: HugoExporterConfig = DEFAULT_PLUGIN_CONFIG;
+  /** lastForms 是按 docId 缓存的最近一次表单填写值，用于 B6 表单字段记忆。 */
+  private lastForms: Record<string, Record<string, unknown>> = {};
 
   /** onload 注册图标、命令、顶栏按钮和设置页。整个流程包 try/catch，便于排查思源运行时差异。 */
   async onload() {
@@ -98,6 +106,17 @@ export default class HugoExporterPlugin extends Plugin {
     } catch (error) {
       console.warn("[hugo-exporter] loadData failed, using defaults", error);
       this.config = DEFAULT_PLUGIN_CONFIG;
+    }
+
+    // NOTE: B6 — 加载上次表单缓存；任意失败都不阻断主流程。
+    try {
+      const saved = (await this.loadData(STORAGE_LAST_FORM)) as unknown;
+      if (saved && typeof saved === "object" && !Array.isArray(saved)) {
+        this.lastForms = saved as Record<string, Record<string, unknown>>;
+      }
+    } catch (error) {
+      console.warn("[hugo-exporter] loadData last-form failed", error);
+      this.lastForms = {};
     }
 
     try {
@@ -247,8 +266,14 @@ export default class HugoExporterPlugin extends Plugin {
             inputs.commitMessage?.value.trim() || fallback.commitMessageTemplate,
           pullBeforePush: inputs.pullBeforePush?.checked ?? fallback.pullBeforePush,
         });
-        void this.saveData(STORAGE_NAME, this.config);
-        showMessage("Hugo Exporter 配置已保存");
+        // NOTE: A4 — saveData 失败必须告知魔尊，避免"保存了实际没落盘"。
+        this.saveData(STORAGE_NAME, this.config).then(
+          () => showMessage("Hugo Exporter 配置已保存"),
+          (error) => {
+            console.error("[hugo-exporter] saveData failed", error);
+            showMessage(`Hugo Exporter 配置保存失败：${this.formatError(error)}`);
+          },
+        );
       },
     });
 
@@ -278,7 +303,27 @@ export default class HugoExporterPlugin extends Plugin {
       });
     };
 
+    /**
+     * sectionHeader 加一条视觉分隔的章节标题项。
+     * 思源 Setting 没暴露分组 API，吾把章节做成一个特殊 item：
+     * - title 用粗体大号，颜色用主题强调色；
+     * - 不接受用户输入，actionElement 是空的占位。
+     */
+    const sectionHeader = (title: string, hint = ""): void => {
+      this.setting.addItem({
+        title,
+        description: hint,
+        createActionElement: () => {
+          const placeholder = document.createElement("div");
+          placeholder.style.cssText = "color:var(--b3-theme-on-surface-light);font-size:12px";
+          placeholder.textContent = "—";
+          return placeholder;
+        },
+      });
+    };
+
     // ------ 一、仓库与导出基础配置（最先要填的，初次安装必看） ------
+    sectionHeader("【一】仓库与导出基础", "首次安装必填；改完点底部「保存」生效");
     safeAddItem({
       title: "Hugo 仓库路径",
       description: "本地 Hugo 仓库根目录的绝对路径，例如 I:/my-blog。",
@@ -325,6 +370,7 @@ export default class HugoExporterPlugin extends Plugin {
     });
 
     // ------ 二、候选项与 frontmatter 默认值（导出弹窗里会用到） ------
+    sectionHeader("【二】候选项与 frontmatter 默认值", "导出弹窗里 chip / YAML 预填都来自这里");
     safeAddItem({
       title: "分类候选（categories）",
       description: "每行一个分类。导出弹窗里会显示为可点击候选，也可以临时手动输入新分类。",
@@ -362,6 +408,7 @@ export default class HugoExporterPlugin extends Plugin {
     });
 
     // ------ 三、Git 推送（可选；启用后导出弹窗会出现「导出并推送」按钮） ------
+    sectionHeader("【三】Git 推送（可选）", "启用后才会出现「导出并推送」按钮；推送会触发 GitHub Actions");
     safeAddItem({
       title: "启用 Git 推送",
       description: "开启后导出弹窗会显示「导出并推送」按钮，关闭则只支持本地写入。",
@@ -374,7 +421,7 @@ export default class HugoExporterPlugin extends Plugin {
     safeAddItem({
       title: "测试 Git 连接",
       description:
-        "立即用最近一次保存的「仓库路径 / Git 可执行路径」执行 git rev-parse --show-toplevel；先点底部『保存』再测最稳。",
+        "用当前输入框里的「仓库路径 / Git 可执行路径」实时执行 git rev-parse --show-toplevel，无需先点保存。",
       build: () => {
         const wrapper = document.createElement("div");
         wrapper.style.cssText = "display:flex;align-items:center;gap:10px;flex-wrap:wrap";
@@ -389,9 +436,12 @@ export default class HugoExporterPlugin extends Plugin {
         status.textContent = "未运行";
 
         button.addEventListener("click", () => {
+          // NOTE: B11 — 直接读输入框当前值，避免必须先点保存才能测试新填的路径。
+          const liveRepoRoot = inputs.repoRoot?.value.trim() || this.config.repoRoot;
+          const liveBinary = inputs.gitBinary?.value.trim() ?? this.config.gitBinary;
           status.textContent = "运行中…";
           status.style.color = "var(--b3-theme-primary)";
-          void this.testGitConnection().then((res) => {
+          void this.testGitConnection(liveRepoRoot, liveBinary).then((res) => {
             status.textContent = res.message;
             status.style.color = res.ok
               ? "var(--b3-card-success-color, #2ca02c)"
@@ -450,6 +500,37 @@ export default class HugoExporterPlugin extends Plugin {
         return inputs.pullBeforePush;
       },
     });
+
+    // ------ 维护操作 ------
+    sectionHeader("【四】维护", "重置配置等不常用操作");
+    safeAddItem({
+      title: "重置为默认配置",
+      description: "把所有配置（含候选项、Git 设置）恢复成插件出厂默认值；操作前会要求确认。",
+      build: () => {
+        const button = document.createElement("button");
+        button.className = "b3-button b3-button--outline";
+        button.textContent = "重置";
+        button.addEventListener("click", () => {
+          confirm(
+            "重置 Hugo Exporter 配置",
+            "将把所有设置恢复为出厂默认值（你保存过的仓库路径、候选项、Git 配置全部丢失）。是否继续？",
+            () => {
+              this.config = { ...DEFAULT_PLUGIN_CONFIG };
+              this.saveData(STORAGE_NAME, this.config).then(
+                () => {
+                  showMessage("已重置为默认配置；请关闭并重新打开设置页查看新值");
+                },
+                (error) => {
+                  console.error("[hugo-exporter] reset saveData failed", error);
+                  showMessage(`重置失败：${this.formatError(error)}`);
+                },
+              );
+            },
+          );
+        });
+        return button;
+      },
+    });
   }
 
   /**
@@ -463,8 +544,15 @@ export default class HugoExporterPlugin extends Plugin {
    */
   private async runExport(): Promise<void> {
     let progress: ProgressDialog | null = null;
+    let stage: "snapshot" | "editor" | "plan" | "write" | "assets" | "git" = "snapshot";
+    let stagePath = "";
     try {
+      stage = "snapshot";
       const doc = await readCurrentDocumentSnapshot();
+
+      stage = "editor";
+      // NOTE: B6 — 把上次填过的字段值（按 docId）传给编辑器作为初始值。
+      const lastValues = this.lastForms[doc.id];
       const outcome = await openFrontmatterEditor(doc, this.config.dryRunDefault, this.config.defaultFrontmatterYaml, {
         repoRoot: this.config.repoRoot,
         contentDir: this.config.contentDir,
@@ -474,12 +562,14 @@ export default class HugoExporterPlugin extends Plugin {
         gitEnabled: this.config.gitEnabled,
         gitRemote: this.config.gitRemote,
         gitBranch: this.config.gitBranch,
+        lastValues,
       });
       if (!outcome) {
         // NOTE: 用户取消，不视为错误，也不弹失败提示。
         return;
       }
 
+      stage = "plan";
       const result = exportHugoPost({
         doc,
         repoRoot: this.config.repoRoot,
@@ -491,6 +581,7 @@ export default class HugoExporterPlugin extends Plugin {
         slug: outcome.slug,
         frontmatterOverride: outcome.frontmatter,
       });
+      stagePath = result.manifest.target;
 
       if (!result.ok || !result.content) {
         showMessage(`Hugo 导出失败：${result.errors.join("; ")}`);
@@ -512,6 +603,16 @@ export default class HugoExporterPlugin extends Plugin {
         return;
       }
 
+      // NOTE: D5 — 写入前若 index.md 已存在，先确认是否覆盖（仅在非 dry-run 时检查）。
+      const indexAbsolute = await this.resolveAbsolutePath(this.config.repoRoot, result.manifest.target);
+      if (await this.fileExists(indexAbsolute)) {
+        const proceed = await this.askOverwrite(result.manifest.target, indexAbsolute);
+        if (!proceed) {
+          showMessage("已取消导出（目标 index.md 已存在）");
+          return;
+        }
+      }
+
       progress = openProgressDialog(outcome.push ? "Hugo 导出并推送" : "Hugo 导出");
       progress.addStep({ id: "write", label: "写入 index.md" });
       progress.addStep({ id: "assets", label: `复制资源（${result.assetPlans.length} 个）` });
@@ -527,6 +628,8 @@ export default class HugoExporterPlugin extends Plugin {
         progress.addStep({ id: "git-push", label: `git push ${this.config.gitRemote}/${this.config.gitBranch}` });
       }
 
+      stage = "write";
+      stagePath = result.manifest.target;
       progress.update("write", "running", result.manifest.target);
       const written = await writeExportedIndex({
         repoRoot: this.config.repoRoot,
@@ -536,11 +639,18 @@ export default class HugoExporterPlugin extends Plugin {
       });
       progress.update("write", "ok", written.absolutePath);
 
-      progress.update("assets", "running");
+      stage = "assets";
+      stagePath = `${result.assetPlans.length} 个资源`;
+      progress.update("assets", "running", `0 / ${result.assetPlans.length}`);
       const assetCopy = await copyExportedAssets({
         repoRoot: this.config.repoRoot,
         dryRun: false,
         assetPlans: result.assetPlans,
+        assetBasePath: this.config.assetBasePath || this.config.repoRoot,
+        concurrency: 8,
+        onProgress: (done, total) => {
+          progress?.update("assets", "running", `${done} / ${total}`);
+        },
       });
       const assetSummary =
         assetCopy.warnings.length > 0
@@ -554,22 +664,98 @@ export default class HugoExporterPlugin extends Plugin {
       const summary = `Hugo 导出完成：${written.absolutePath}；资源 ${assetCopy.copied.length} 个`;
       showMessage(summary);
 
+      // NOTE: B6 — 写入成功后把本次字段缓存起来，下次开同一文档自动预填。
+      void this.rememberLastForm(doc.id, outcome.frontmatter);
+
       if (!outcome.push) {
         progress.finalize(true, summary);
         return;
       }
 
-      const pushSummary = await this.runGitPush(progress, {
+      stage = "git";
+      stagePath = `${this.config.gitRemote}/${this.config.gitBranch}`;
+      const pushParams = {
         slug: outcome.slug,
         title: doc.title,
         bundleRelativeDir: dirnameRelative(result.manifest.target),
-      });
+      };
+      const pushSummary = await this.runGitPush(progress, pushParams);
       progress.finalize(pushSummary.ok, pushSummary.text);
+      if (!pushSummary.ok) {
+        // NOTE: B2 — 失败时给一个"仅重试推送"按钮，魔尊修好凭据/网络后一键再试。
+        const retry = async (): Promise<void> => {
+          if (!progress) return;
+          progress.setActionButton(null);
+          progress.update("git-verify", "pending", "");
+          progress.update("git-status", "pending", "");
+          progress.update("git-add", "pending", "");
+          progress.update("git-commit", "pending", "");
+          progress.update("git-push", "pending", "");
+          if (this.config.pullBeforePush) progress.update("git-pull", "pending", "");
+          const retrySummary = await this.runGitPush(progress, pushParams);
+          progress.finalize(retrySummary.ok, retrySummary.text);
+          if (!retrySummary.ok) {
+            progress.setActionButton({ label: "仅重试推送", onClick: () => void retry() });
+          }
+        };
+        progress.setActionButton({ label: "仅重试推送", onClick: () => void retry() });
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "未知错误";
-      showMessage(`Hugo 导出异常：${message}`);
-      if (progress) progress.finalize(false, `异常：${message}`);
+      // NOTE: B3 — 错误信息附加阶段与路径，避免魔尊看不到具体哪个文件失败。
+      const decoratedMessage = `Hugo 导出异常（${stage}${stagePath ? ` ${stagePath}` : ""}）：${message}`;
+      showMessage(decoratedMessage);
+      if (progress) {
+        progress.appendLog(`[error ${stage}] ${stagePath ? `${stagePath} · ` : ""}${message}`);
+        progress.finalize(false, decoratedMessage);
+      }
     }
+  }
+
+  /** rememberLastForm 把本次填的非 title/date/lastmod 字段缓存到 storage，便于下次预填。 */
+  private async rememberLastForm(docId: string, frontmatter: Record<string, unknown>): Promise<void> {
+    if (!docId) return;
+    const cleaned: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(frontmatter)) {
+      if (key === "title" || key === "date" || key === "lastmod") continue;
+      cleaned[key] = value;
+    }
+    this.lastForms = { ...this.lastForms, [docId]: cleaned };
+    try {
+      await this.saveData(STORAGE_LAST_FORM, this.lastForms);
+    } catch (error) {
+      console.warn("[hugo-exporter] saveData last-form failed", error);
+    }
+  }
+
+  /** resolveAbsolutePath 简易拼接绝对路径，用于 D5 检查 index.md 是否已存在（不引入 node:path）。 */
+  private async resolveAbsolutePath(repoRoot: string, relative: string): Promise<string> {
+    const root = repoRoot.replaceAll("\\", "/").replace(/\/+$/g, "");
+    const rel = relative.replaceAll("\\", "/").replace(/^\/+/g, "");
+    return `${root}/${rel}`;
+  }
+
+  /** fileExists 通过 fs/promises 探测文件是否存在；任何异常都返回 false。 */
+  private async fileExists(absolutePath: string): Promise<boolean> {
+    try {
+      const fs = await import("node:fs/promises");
+      await fs.access(absolutePath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** askOverwrite 弹一个确认框让魔尊决定是否覆盖已存在的 index.md。 */
+  private askOverwrite(_relative: string, absolute: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      confirm(
+        "目标已存在",
+        `${absolute}\n\n该文件已经存在。是否覆盖？\n\n注意：images/ 目录里同名图片也会被新文件替换。`,
+        () => resolve(true),
+        () => resolve(false),
+      );
+    });
   }
 
   /**
@@ -609,15 +795,30 @@ export default class HugoExporterPlugin extends Plugin {
     showMessage(`Hugo 推送中：${this.config.gitRemote}/${this.config.gitBranch} · ${commitMessage}`);
     progress.update("git-verify", "running");
 
-    const pushResult = await exportPushBundle({
-      binary,
-      repoRoot: this.config.repoRoot,
-      bundleRelativeDir: input.bundleRelativeDir,
-      remote: this.config.gitRemote,
-      branch: this.config.gitBranch,
-      commitMessage,
-      pullBeforePush: this.config.pullBeforePush,
-    });
+    // NOTE: B4 — push 步骤 30s 超时提示。push 实际仍在跑（git push 没有可靠超时），
+    //       只是把 detail 改成"已等待 30 秒，常见原因 + 排查建议"，避免魔尊以为卡死。
+    const pushHintTimer = window.setTimeout(() => {
+      progress.update(
+        "git-push",
+        "running",
+        "已等待 30 秒，仍在进行中。常见原因：① 凭据管理器弹窗在后台 ② 远端不可达 ③ 大文件推送中。可在终端单独 git push 排查。",
+      );
+    }, 30_000);
+
+    let pushResult;
+    try {
+      pushResult = await exportPushBundle({
+        binary,
+        repoRoot: this.config.repoRoot,
+        bundleRelativeDir: input.bundleRelativeDir,
+        remote: this.config.gitRemote,
+        branch: this.config.gitBranch,
+        commitMessage,
+        pullBeforePush: this.config.pullBeforePush,
+      });
+    } finally {
+      window.clearTimeout(pushHintTimer);
+    }
 
     console.log("[hugo-exporter] git push steps", pushResult);
 
@@ -667,14 +868,19 @@ export default class HugoExporterPlugin extends Plugin {
 
   /**
    * testGitConnection 在设置页里验证 git 是否在仓库根可用。
+   * 输入：repoRoot 与 binary（可由设置页实时输入框传入，避免必须先点保存）。
    * 返回：UI 可直接渲染的 ok 标记 + 单行 message；同时也发一条 toast 兜底。
    */
-  private async testGitConnection(): Promise<{ ok: boolean; message: string }> {
+  private async testGitConnection(
+    repoRootOverride?: string,
+    binaryOverride?: string,
+  ): Promise<{ ok: boolean; message: string }> {
     try {
-      const binary = await resolveGitBinary(this.config.gitBinary);
-      const result = await verifyGitRepository(binary, this.config.repoRoot);
+      const repoRoot = (repoRootOverride ?? this.config.repoRoot).trim() || this.config.repoRoot;
+      const binary = await resolveGitBinary(binaryOverride ?? this.config.gitBinary);
+      const result = await verifyGitRepository(binary, repoRoot);
       if (result.ok) {
-        const top = result.stdout.trim() || this.config.repoRoot;
+        const top = result.stdout.trim() || repoRoot;
         const message = `Git 正常：${top}（git=${binary}）`;
         showMessage(`Git 连接正常：${top}`);
         return { ok: true, message };

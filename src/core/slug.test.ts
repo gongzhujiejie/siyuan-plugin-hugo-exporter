@@ -29,5 +29,17 @@ describe("buildBundlePaths", () => {
 
   it("rejects traversal slugs", () => {
     expect(() => buildBundlePaths("I:/my-blog", "../../evil", FIXIT_BLOG_PRESET)).toThrow("Unsafe slug");
+    expect(() => buildBundlePaths("I:/my-blog", "..", FIXIT_BLOG_PRESET)).toThrow("Unsafe slug");
+    expect(() => buildBundlePaths("I:/my-blog", "foo/../bar", FIXIT_BLOG_PRESET)).toThrow("Unsafe slug");
+    expect(() => buildBundlePaths("I:/my-blog", String.raw`foo\..\bar`, FIXIT_BLOG_PRESET)).toThrow(
+      "Unsafe slug",
+    );
+  });
+
+  it("does not reject titles that merely contain consecutive dots", () => {
+    // NOTE: 路径穿越判定按段落，而非整字符串 includes("..")。
+    expect(buildBundlePaths("I:/my-blog", "Hello..World", FIXIT_BLOG_PRESET).slug).toBe("hello-world");
+    expect(buildBundlePaths("I:/my-blog", "C++..Tips", FIXIT_BLOG_PRESET).slug).toBe("c-tips");
+    expect(buildBundlePaths("I:/my-blog", "version 2..3", FIXIT_BLOG_PRESET).slug).toBe("version-2-3");
   });
 });

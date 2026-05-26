@@ -70,6 +70,7 @@ describe("copyExportedAssets", () => {
       const result = await copyExportedAssets({
         repoRoot: root,
         dryRun: false,
+        assetBasePath: sourceDir,
         assetPlans: [
           {
             originalUrl: "assets/foo.png",
@@ -101,6 +102,7 @@ describe("copyExportedAssets", () => {
       const result = await copyExportedAssets({
         repoRoot: root,
         dryRun: true,
+        assetBasePath: sourceDir,
         assetPlans: [
           {
             originalUrl: "assets/foo.png",
@@ -128,6 +130,7 @@ describe("copyExportedAssets", () => {
       const result = await copyExportedAssets({
         repoRoot: root,
         dryRun: false,
+        assetBasePath: root,
         assetPlans: [
           {
             originalUrl: "assets/missing.png",
@@ -143,6 +146,74 @@ describe("copyExportedAssets", () => {
       expect(result.warnings[0]).toContain("Missing asset source");
     } finally {
       await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses to read sources outside assetBasePath", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hugo-exporter-"));
+    const innocentBase = await mkdtemp(join(tmpdir(), "siyuan-base-"));
+    const evilDir = await mkdtemp(join(tmpdir(), "evil-outside-"));
+    const evilSource = join(evilDir, "stolen.txt");
+    await writeFile(evilSource, "secret", "utf8");
+
+    try {
+      const result = await copyExportedAssets({
+        repoRoot: root,
+        dryRun: false,
+        assetBasePath: innocentBase,
+        assetPlans: [
+          {
+            originalUrl: "assets/../../../stolen.txt",
+            sourcePath: evilSource,
+            targetRelativePath: "content/posts/acfun/images/stolen.txt",
+            rewrittenUrl: "images/stolen.txt",
+          },
+        ],
+      });
+
+      expect(result.copied).toEqual([]);
+      expect(result.skipped).toEqual(["content/posts/acfun/images/stolen.txt"]);
+      expect(result.warnings[0]).toContain("Refuse to copy asset outside assetBasePath");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+      await rm(innocentBase, { recursive: true, force: true });
+      await rm(evilDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports progress incrementally for each asset", async () => {
+    const root = await mkdtemp(join(tmpdir(), "hugo-exporter-"));
+    const sourceDir = await mkdtemp(join(tmpdir(), "siyuan-assets-"));
+
+    try {
+      const plans = [];
+      for (let i = 0; i < 4; i += 1) {
+        const file = join(sourceDir, `f${i}.png`);
+        await writeFile(file, `data${i}`, "utf8");
+        plans.push({
+          originalUrl: `assets/f${i}.png`,
+          sourcePath: file,
+          targetRelativePath: `content/posts/acfun/images/f${i}.png`,
+          rewrittenUrl: `images/f${i}.png`,
+        });
+      }
+
+      const progressEvents: Array<[number, number]> = [];
+      const result = await copyExportedAssets({
+        repoRoot: root,
+        dryRun: false,
+        assetBasePath: sourceDir,
+        assetPlans: plans,
+        concurrency: 2,
+        onProgress: (done, total) => progressEvents.push([done, total]),
+      });
+
+      expect(result.copied).toHaveLength(4);
+      expect(progressEvents.map(([d]) => d).sort((a, b) => a - b)).toEqual([1, 2, 3, 4]);
+      expect(progressEvents.every(([, total]) => total === 4)).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+      await rm(sourceDir, { recursive: true, force: true });
     }
   });
 });
