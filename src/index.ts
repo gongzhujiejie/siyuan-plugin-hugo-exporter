@@ -23,6 +23,12 @@ import {
   renderCommitMessage,
 } from "./config";
 import { exportHugoPost } from "./core/exportPipeline";
+import {
+  estimateLastFormsBytes,
+  type LastFormsMap,
+  normalizeLastForms,
+  pruneLastForms,
+} from "./core/lastForms";
 import { openFrontmatterEditor } from "./ui/frontmatterEditor";
 import { openProgressDialog, type ProgressDialog } from "./ui/progressDialog";
 
@@ -30,9 +36,16 @@ const STORAGE_NAME = "hugo-exporter-config.json";
 
 /**
  * STORAGE_LAST_FORM 缓存按文档 ID 的最近一次表单填写值，用于 B6 表单字段记忆。
- * 结构：{ "<docId>": { categories: [...], tags: [...], description: "..." } }
+ * v0.2.4 起结构升级为 LastFormsMap = Record<docId, {fields, lastAccessedAt}>，
+ * 旧格式（裸 fields 对象）由 normalizeLastForms 自动迁移。
  */
 const STORAGE_LAST_FORM = "hugo-exporter-last-form.json";
+
+/** LASTFORM_LIMIT 控制 LRU 容量；超过则按 lastAccessedAt 删最旧的。 */
+const LASTFORM_LIMIT = 500;
+
+/** LASTFORM_TTL_DAYS 控制时间淘汰阈值；超过这么多天未访问则清理。 */
+const LASTFORM_TTL_DAYS = 90;
 
 /**
  * HUGO_ICON_SVG 注册自定义图标。
@@ -86,10 +99,10 @@ function stringifyOptions(options: string[]): string {
  * 当前版本提供：自定义顶栏图标 + 合并导出入口 + 配置页 + dry-run / 正式导出。
  */
 export default class HugoExporterPlugin extends Plugin {
-  private static readonly VERSION = "0.2.3";
+  private static readonly VERSION = "0.2.4";
   private config: HugoExporterConfig = DEFAULT_PLUGIN_CONFIG;
-  /** lastForms 是按 docId 缓存的最近一次表单填写值，用于 B6 表单字段记忆。 */
-  private lastForms: Record<string, Record<string, unknown>> = {};
+  /** lastForms 是按 docId 缓存的最近一次表单填写值；新结构含 lastAccessedAt 时间戳。 */
+  private lastForms: LastFormsMap = {};
 
   /** onload 注册图标、命令、顶栏按钮和设置页。整个流程包 try/catch，便于排查思源运行时差异。 */
   async onload() {
@@ -111,12 +124,10 @@ export default class HugoExporterPlugin extends Plugin {
       this.config = DEFAULT_PLUGIN_CONFIG;
     }
 
-    // NOTE: B6 — 加载上次表单缓存；任意失败都不阻断主流程。
+    // NOTE: B6 — 加载上次表单缓存；任意失败都不阻断主流程。v0.2.4 起改用 normalizeLastForms 自动迁移旧格式。
     try {
-      const saved = (await this.loadData(STORAGE_LAST_FORM)) as unknown;
-      if (saved && typeof saved === "object" && !Array.isArray(saved)) {
-        this.lastForms = saved as Record<string, Record<string, unknown>>;
-      }
+      const saved = await this.loadData(STORAGE_LAST_FORM);
+      this.lastForms = normalizeLastForms(saved);
     } catch (error) {
       console.warn("[hugo-exporter] loadData last-form failed", error);
       this.lastForms = {};
@@ -141,6 +152,28 @@ export default class HugoExporterPlugin extends Plugin {
       console.error("[hugo-exporter] registerTopBar failed", error);
       showMessage(`Hugo 顶栏注册失败：${this.formatError(error)}`);
     }
+
+    // NOTE: 启动后异步淘汰陈旧表单缓存，不阻塞 UI；只跑 TTL + LRU，不调思源 API（避免启动延迟）。
+    //       死链淘汰留给设置页里的"清理"按钮主动触发。
+    setTimeout(() => {
+      try {
+        const result = pruneLastForms(this.lastForms, {
+          ttlDays: LASTFORM_TTL_DAYS,
+          maxEntries: LASTFORM_LIMIT,
+        });
+        const removedCount =
+          result.removed.byTtl.length + result.removed.byLimit.length + result.removed.byMissingDoc.length;
+        if (removedCount > 0) {
+          this.lastForms = result.pruned;
+          void this.saveData(STORAGE_LAST_FORM, this.lastForms);
+          console.log(
+            `[hugo-exporter] auto-pruned lastForms: ${removedCount} removed (ttl=${result.removed.byTtl.length}, lru=${result.removed.byLimit.length})`,
+          );
+        }
+      } catch (error) {
+        console.warn("[hugo-exporter] auto-prune failed", error);
+      }
+    }, 1500);
   }
 
   /** formatError 统一序列化错误信息，避免 [object Object] 出现在 toast 中。 */
@@ -532,6 +565,65 @@ export default class HugoExporterPlugin extends Plugin {
     });
 
     safeAddItem({
+      title: "清理表单缓存",
+      description: `自动 LRU 淘汰策略：超过 ${LASTFORM_TTL_DAYS} 天未访问 / 超过 ${LASTFORM_LIMIT} 条都会自动清理。手动按钮可立刻全部清空。`,
+      build: () => {
+        const wrapper = document.createElement("div");
+        wrapper.style.cssText = "display:flex;align-items:center;gap:10px;flex-wrap:wrap";
+
+        const status = document.createElement("span");
+        status.style.cssText =
+          "font-size:12px;color:var(--b3-theme-on-surface-light);word-break:break-all;max-width:380px";
+        const updateStatus = (): void => {
+          const count = Object.keys(this.lastForms).length;
+          if (count === 0) {
+            status.textContent = "当前缓存为空";
+          } else {
+            const bytes = estimateLastFormsBytes(this.lastForms);
+            const sizeText = bytes >= 1024 ? `${(bytes / 1024).toFixed(1)} KB` : `${bytes} B`;
+            status.textContent = `已记忆 ${count} 篇文档，约 ${sizeText}`;
+          }
+        };
+        updateStatus();
+
+        const clearButton = document.createElement("button");
+        clearButton.className = "b3-button b3-button--outline";
+        clearButton.textContent = "清空全部";
+        clearButton.addEventListener("click", () => {
+          const count = Object.keys(this.lastForms).length;
+          if (count === 0) {
+            showMessage("缓存已经是空的");
+            return;
+          }
+          confirm(
+            "清理表单缓存",
+            `确定清空 ${count} 篇文档的字段记忆？\n\n` +
+              "• 之后再导出这些文档时不会再自动预填上次填过的字段；\n" +
+              "• 已发布的远端文章不受影响；\n" +
+              "• 候选项白名单（categories / tags / collections）保留不动。",
+            () => {
+              this.lastForms = {};
+              this.saveData(STORAGE_LAST_FORM, this.lastForms).then(
+                () => {
+                  updateStatus();
+                  showMessage("表单缓存已清空");
+                },
+                (error) => {
+                  console.error("[hugo-exporter] clear last-form failed", error);
+                  showMessage(`清理失败：${this.formatError(error)}`);
+                },
+              );
+            },
+          );
+        });
+
+        wrapper.appendChild(clearButton);
+        wrapper.appendChild(status);
+        return wrapper;
+      },
+    });
+
+    safeAddItem({
       title: "重置为默认配置",
       description: "把所有配置（含候选项、Git 设置）恢复成插件出厂默认值；操作前会要求确认。",
       build: () => {
@@ -588,7 +680,16 @@ export default class HugoExporterPlugin extends Plugin {
 
       stage = "editor";
       // NOTE: B6 — 把上次填过的字段值（按 docId）传给编辑器作为初始值。
-      const lastValues = this.lastForms[doc.id];
+      //       v0.2.4 起 lastForms 是 {fields, lastAccessedAt} 结构，这里取 fields；
+      //       同时刷新 lastAccessedAt 以保护活跃文档不被 LRU 淘汰。
+      const lastRecord = this.lastForms[doc.id];
+      const lastValues = lastRecord?.fields;
+      if (lastRecord) {
+        this.lastForms = {
+          ...this.lastForms,
+          [doc.id]: { fields: lastRecord.fields, lastAccessedAt: new Date().toISOString() },
+        };
+      }
       const outcome = await openFrontmatterEditor(doc, this.config.dryRunDefault, this.config.defaultFrontmatterYaml, {
         repoRoot: this.config.repoRoot,
         contentDir: this.config.contentDir,
@@ -778,7 +879,11 @@ export default class HugoExporterPlugin extends Plugin {
       if (key === "title" || key === "date" || key === "lastmod") continue;
       cleaned[key] = value;
     }
-    this.lastForms = { ...this.lastForms, [docId]: cleaned };
+    // NOTE: 升级后的结构带 lastAccessedAt，便于 LRU 淘汰旧文档。
+    this.lastForms = {
+      ...this.lastForms,
+      [docId]: { fields: cleaned, lastAccessedAt: new Date().toISOString() },
+    };
     try {
       await this.saveData(STORAGE_LAST_FORM, this.lastForms);
     } catch (error) {
@@ -988,18 +1093,21 @@ export default class HugoExporterPlugin extends Plugin {
     this.config = { ...this.config, [fieldKey]: renamed };
 
     // 联动更新 lastForms：每个 docId 下的同字段已选中值也要把 oldName 改成 newName。
-    const updatedForms: Record<string, Record<string, unknown>> = {};
-    for (const [docId, form] of Object.entries(this.lastForms)) {
-      const value = form[key];
+    const updatedForms: LastFormsMap = {};
+    for (const [docId, record] of Object.entries(this.lastForms)) {
+      const value = record.fields[key];
       if (Array.isArray(value)) {
         const next: string[] = [];
         for (const v of value) {
           const replaced = v === oldName ? newName : v;
           if (typeof replaced === "string" && !next.includes(replaced)) next.push(replaced);
         }
-        updatedForms[docId] = { ...form, [key]: next };
+        updatedForms[docId] = {
+          fields: { ...record.fields, [key]: next },
+          lastAccessedAt: record.lastAccessedAt,
+        };
       } else {
-        updatedForms[docId] = form;
+        updatedForms[docId] = record;
       }
     }
     this.lastForms = updatedForms;
@@ -1029,13 +1137,16 @@ export default class HugoExporterPlugin extends Plugin {
     if (next.length === this.config[fieldKey].length) return;
     this.config = { ...this.config, [fieldKey]: next };
 
-    const updatedForms: Record<string, Record<string, unknown>> = {};
-    for (const [docId, form] of Object.entries(this.lastForms)) {
-      const value = form[key];
+    const updatedForms: LastFormsMap = {};
+    for (const [docId, record] of Object.entries(this.lastForms)) {
+      const value = record.fields[key];
       if (Array.isArray(value)) {
-        updatedForms[docId] = { ...form, [key]: value.filter((v) => v !== name) };
+        updatedForms[docId] = {
+          fields: { ...record.fields, [key]: value.filter((v) => v !== name) },
+          lastAccessedAt: record.lastAccessedAt,
+        };
       } else {
-        updatedForms[docId] = form;
+        updatedForms[docId] = record;
       }
     }
     this.lastForms = updatedForms;
