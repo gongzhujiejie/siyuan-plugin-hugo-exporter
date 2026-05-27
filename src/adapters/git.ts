@@ -410,3 +410,144 @@ function trimFirstLine(text: string): string {
   }
   return "";
 }
+
+// ----------------------- publishPublicSnapshot：把 public/ 强推到公开仓库 -----------------------
+
+/** PublishPublicInput 是把 public/ 目录强推到公开仓库的输入。 */
+export interface PublishPublicInput {
+  /** binary 是 git 可执行文件路径，应由调用方先 resolveGitBinary。 */
+  binary: string;
+  /** publicDir 是本地 hugo build 产物的绝对路径。 */
+  publicDir: string;
+  /** repoUrl 是公开仓库 https URL，例如 https://github.com/<owner>/<repo>.github.io.git。 */
+  repoUrl: string;
+  /** branch 是公开仓库目标分支，通常是 main。 */
+  branch: string;
+  /** commitMessage 是这次发布的 commit 标题；调用方决定关联到哪个源 commit。 */
+  commitMessage: string;
+  /** cname 不为空时会写入 public 副本的 CNAME 文件，保留自定义域名。 */
+  cname: string;
+  /** addNoJekyll 控制是否写入 .nojekyll，让 _ 开头资源不被 GitHub Pages 忽略；推荐 true。 */
+  addNoJekyll: boolean;
+}
+
+/** PublishPublicResult 汇总发布流程的关键信息。 */
+export interface PublishPublicResult {
+  ok: boolean;
+  /** 失败时给的简短原因，已是单行可放 toast。 */
+  errorMessage?: string;
+  /** 失败发生在哪个阶段，便于 UI 展示。 */
+  failedStep?: string;
+  /** 成功时本次发布 commit 的 sha。 */
+  commitSha?: string;
+}
+
+/** isHttpsGitHubUrl 防御性校验：避免误推到非 GitHub 或非 https 的仓库。 */
+function isHttpsGitHubUrl(url: string): boolean {
+  if (!url) return false;
+  return /^https:\/\/github\.com\/[^/]+\/[^/]+(?:\.git)?$/i.test(url.trim());
+}
+
+/**
+ * publishPublicSnapshot 把 publicDir 复制到临时目录、init 一个新 git 工作区、强推到目标公开仓库。
+ *
+ * 流程（任一步失败立即返回，不留副作用在源仓库）：
+ *   1. 校验 repoUrl 必须是 https://github.com/.../... 形式；
+ *   2. mkdtemp 临时目录；
+ *   3. cp -r publicDir/* 到临时目录；
+ *   4. （可选）写 CNAME / .nojekyll；
+ *   5. git init -q + checkout -b <branch>；
+ *   6. git add -A + git commit；
+ *   7. git push --force <repoUrl> <branch>:<branch>；
+ *   8. finally：rm -rf 临时目录。
+ *
+ * 安全说明：
+ * - publicDir 必须存在，且只复制其内容（避免把符号链接父目录复制走）；
+ * - 推送只面向单一 branch，使用 force 是为让公开仓库 main 永远等于"最新本次产物"，便于回滚到任一源 commit；
+ * - 不影响源仓库的 git 状态。
+ */
+export async function publishPublicSnapshot(input: PublishPublicInput): Promise<PublishPublicResult> {
+  if (!isHttpsGitHubUrl(input.repoUrl)) {
+    return {
+      ok: false,
+      failedStep: "validate-url",
+      errorMessage: `仅支持 https://github.com/<owner>/<repo> 形式的公开仓库，收到：${input.repoUrl}`,
+    };
+  }
+  if (!input.branch || !input.branch.trim()) {
+    return { ok: false, failedStep: "validate-branch", errorMessage: "公开仓库目标分支不能为空" };
+  }
+  if (!input.publicDir) {
+    return { ok: false, failedStep: "validate-public", errorMessage: "Hugo public/ 目录路径未提供" };
+  }
+
+  const fs = await import("node:fs/promises");
+  const path = await import("node:path");
+  const os = await import("node:os");
+
+  // 校验 publicDir 存在
+  try {
+    await fs.access(input.publicDir);
+  } catch {
+    return {
+      ok: false,
+      failedStep: "validate-public",
+      errorMessage: `Hugo public/ 目录不存在或不可读：${input.publicDir}`,
+    };
+  }
+
+  const workRoot = await fs.mkdtemp(path.join(os.tmpdir(), "hugo-publish-"));
+  try {
+    // 复制 publicDir 全部内容到 workRoot
+    await fs.cp(input.publicDir, workRoot, { recursive: true });
+
+    if (input.addNoJekyll) {
+      await fs.writeFile(path.join(workRoot, ".nojekyll"), "", "utf8");
+    }
+    if (input.cname && input.cname.trim()) {
+      await fs.writeFile(path.join(workRoot, "CNAME"), input.cname.trim(), "utf8");
+    }
+
+    // 顺序跑 git 命令；任一失败即停。
+    const branch = input.branch.trim();
+    const steps: Array<{ name: string; args: string[] }> = [
+      { name: "init", args: ["init", "-q"] },
+      { name: "checkout", args: ["checkout", "-q", "-b", branch] },
+      { name: "config-name", args: ["config", "user.name", "hugo-exporter"] },
+      { name: "config-email", args: ["config", "user.email", "hugo-exporter@users.noreply.github.com"] },
+      { name: "add", args: ["add", "-A"] },
+      { name: "commit", args: ["commit", "-q", "-m", input.commitMessage || "deploy: public snapshot"] },
+      { name: "push", args: ["push", "--force", input.repoUrl, `${branch}:${branch}`] },
+    ];
+
+    for (const step of steps) {
+      const res = await runGit({ binary: input.binary, cwd: workRoot, args: step.args });
+      if (!res.ok) {
+        return {
+          ok: false,
+          failedStep: step.name,
+          errorMessage: trimFirstLine(res.stderr || res.stdout) || `git ${step.name} failed`,
+        };
+      }
+    }
+
+    // 取本次 commit 的 sha 用于 toast
+    const head = await runGit({ binary: input.binary, cwd: workRoot, args: ["rev-parse", "HEAD"] });
+    const sha = head.ok ? head.stdout.trim() : "";
+
+    return { ok: true, commitSha: sha };
+  } catch (error) {
+    return {
+      ok: false,
+      failedStep: "exception",
+      errorMessage: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    try {
+      await fs.rm(workRoot, { recursive: true, force: true });
+    } catch (cleanupError) {
+      // NOTE: 临时目录清理失败不阻断主流程，仅 console 警告。
+      console.warn("[hugo-exporter] cleanup publish workspace failed", cleanupError);
+    }
+  }
+}

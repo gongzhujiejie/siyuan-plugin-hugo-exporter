@@ -38,6 +38,28 @@ export interface HugoExporterConfig {
   commitMessageTemplate: string;
   /** pullBeforePush 是否在推送前 pull --rebase；按当前部署链路默认关闭。 */
   pullBeforePush: boolean;
+
+  // ----------------------- 站点发布（一键到公开 Pages 仓库） -----------------------
+
+  /** autoPublishEnabled 控制是否在「导出并推送」成功后自动跑本地 hugo build → 推 public/。 */
+  autoPublishEnabled: boolean;
+  /** hugoBinary 留空时由 build adapter 自动探测；否则传绝对路径。 */
+  hugoBinary: string;
+  /**
+   * hugoArgs 是 hugo build 的命令行参数（每行一个）；
+   * 默认带 --gc / --minify，并强制 --enableGitInfo=false 避免缺 git 时炸。
+   */
+  hugoArgs: string[];
+  /** pagefindEnabled 控制 hugo build 后是否构建搜索索引。 */
+  pagefindEnabled: boolean;
+  /** pagefindBinary 留空时尝试 node_modules/@pagefind/{platform}/bin/pagefind_extended(.exe)。 */
+  pagefindBinary: string;
+  /** publishRepoUrl 是公开 Pages 仓库的 https 地址。 */
+  publishRepoUrl: string;
+  /** publishBranch 是公开仓库的目标分支，通常是 main。 */
+  publishBranch: string;
+  /** publishCNAME 留空则不写 CNAME；魔尊用了自定义域名（如 lpppp.xyz）就填进来。 */
+  publishCNAME: string;
 }
 
 /** DEFAULT_FRONTMATTER_YAML 是符合多数博客主题（FixIt / Hugo 默认）的通用 frontmatter 起步模板。 */
@@ -56,10 +78,19 @@ export const EXAMPLE_TAG_OPTIONS = ["前端", "后端", "工具"];
 export const EXAMPLE_COLLECTION_OPTIONS: string[] = [];
 
 /**
+ * DEFAULT_HUGO_ARGS 是 hugo build 的默认参数。
+ * - --gc: 清理孤立资源；
+ * - --minify: 压缩 HTML/CSS/JS；
+ * - --enableGitInfo=false: 避免在 PATH 没 git 时崩，每次 push 都会重写 lastmod 时间戳影响也不大。
+ */
+export const DEFAULT_HUGO_ARGS = ["--gc", "--minify", "--enableGitInfo=false"];
+
+/**
  * DEFAULT_PLUGIN_CONFIG 是发布给所有用户的默认值，必须保持"通用且空"。
  * - 路径相关：repoRoot / assetBasePath 留空，用户必须自己填，避免误写到错误目录。
  * - 候选项：默认空数组，免得新用户看到一堆莫名的分类。
  * - 默认 YAML 保留通用模板，对所有 Hugo 主题都适用。
+ * - 站点发布相关：autoPublishEnabled 默认关，避免新用户被吓到；URL 留空。
  */
 export const DEFAULT_PLUGIN_CONFIG: HugoExporterConfig = {
   repoRoot: "",
@@ -77,6 +108,14 @@ export const DEFAULT_PLUGIN_CONFIG: HugoExporterConfig = {
   gitBranch: "main",
   commitMessageTemplate: "post: {slug}",
   pullBeforePush: false,
+  autoPublishEnabled: false,
+  hugoBinary: "",
+  hugoArgs: DEFAULT_HUGO_ARGS,
+  pagefindEnabled: true,
+  pagefindBinary: "",
+  publishRepoUrl: "",
+  publishBranch: "main",
+  publishCNAME: "",
 };
 
 /**
@@ -121,6 +160,14 @@ export function mergePluginConfig(input: Partial<HugoExporterConfig> | undefined
     gitBranch: pickString("gitBranch"),
     commitMessageTemplate: pickString("commitMessageTemplate"),
     pullBeforePush: pickBool("pullBeforePush"),
+    autoPublishEnabled: pickBool("autoPublishEnabled"),
+    hugoBinary: pickString("hugoBinary"),
+    hugoArgs: pickStringArray("hugoArgs"),
+    pagefindEnabled: pickBool("pagefindEnabled"),
+    pagefindBinary: pickString("pagefindBinary"),
+    publishRepoUrl: pickString("publishRepoUrl"),
+    publishBranch: pickString("publishBranch"),
+    publishCNAME: pickString("publishCNAME"),
   };
 }
 

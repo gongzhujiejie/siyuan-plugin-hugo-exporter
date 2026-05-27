@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { exportPushBundle, isInsideRepoBoundary, resolveGitBinary, runGit } from "./git";
+import { exportPushBundle, isInsideRepoBoundary, publishPublicSnapshot, resolveGitBinary, runGit } from "./git";
 
 // NOTE: git adapter 在插件运行时懒加载 global/window.require；测试环境手动桥接 Node require。
 import { createRequire } from "node:module";
@@ -97,6 +97,70 @@ describe("exportPushBundle", () => {
       expect(result.pushed).toBe(false);
     } finally {
       await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("publishPublicSnapshot", () => {
+  it("rejects non-https / non-github URLs", async () => {
+    const result = await publishPublicSnapshot({
+      binary: "git",
+      publicDir: "/tmp/public",
+      repoUrl: "git@github.com:foo/bar.git",
+      branch: "main",
+      commitMessage: "deploy",
+      cname: "",
+      addNoJekyll: true,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.failedStep).toBe("validate-url");
+  });
+
+  it("rejects empty branch", async () => {
+    const result = await publishPublicSnapshot({
+      binary: "git",
+      publicDir: "/tmp/public",
+      repoUrl: "https://github.com/foo/bar.git",
+      branch: "   ",
+      commitMessage: "deploy",
+      cname: "",
+      addNoJekyll: true,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.failedStep).toBe("validate-branch");
+  });
+
+  it("rejects when publicDir does not exist", async () => {
+    const result = await publishPublicSnapshot({
+      binary: "git",
+      publicDir: "/path/does/not/exist/xyz123",
+      repoUrl: "https://github.com/foo/bar.git",
+      branch: "main",
+      commitMessage: "deploy",
+      cname: "",
+      addNoJekyll: true,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.failedStep).toBe("validate-public");
+  });
+
+  it("returns init-step failure when binary is unreachable", async () => {
+    const tmp = await mkdtemp(join(tmpdir(), "hugo-public-"));
+    try {
+      const result = await publishPublicSnapshot({
+        binary: "definitely-not-a-real-binary",
+        publicDir: tmp,
+        repoUrl: "https://github.com/foo/bar.git",
+        branch: "main",
+        commitMessage: "deploy",
+        cname: "",
+        addNoJekyll: true,
+      });
+      expect(result.ok).toBe(false);
+      // 走到 init step（runCommand 内部已捕获 spawn 错误返回 result.ok=false）
+      expect(["init", "exception"]).toContain(result.failedStep);
+    } finally {
+      await rm(tmp, { recursive: true, force: true });
     }
   });
 });

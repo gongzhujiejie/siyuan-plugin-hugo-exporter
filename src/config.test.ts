@@ -97,6 +97,17 @@ describe("DEFAULT_PLUGIN_CONFIG git defaults", () => {
     expect(DEFAULT_PLUGIN_CONFIG.categoryOptions).toEqual([]);
     expect(DEFAULT_PLUGIN_CONFIG.tagOptions).toEqual([]);
     expect(DEFAULT_PLUGIN_CONFIG.collectionOptions).toEqual([]);
+    expect(DEFAULT_PLUGIN_CONFIG.publishRepoUrl).toBe("");
+    expect(DEFAULT_PLUGIN_CONFIG.publishCNAME).toBe("");
+  });
+
+  it("ships with safe publish defaults (off by default)", () => {
+    expect(DEFAULT_PLUGIN_CONFIG.autoPublishEnabled).toBe(false);
+    expect(DEFAULT_PLUGIN_CONFIG.hugoBinary).toBe("");
+    expect(DEFAULT_PLUGIN_CONFIG.hugoArgs).toEqual(["--gc", "--minify", "--enableGitInfo=false"]);
+    expect(DEFAULT_PLUGIN_CONFIG.pagefindEnabled).toBe(true);
+    expect(DEFAULT_PLUGIN_CONFIG.pagefindBinary).toBe("");
+    expect(DEFAULT_PLUGIN_CONFIG.publishBranch).toBe("main");
   });
 });
 

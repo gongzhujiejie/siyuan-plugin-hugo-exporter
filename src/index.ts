@@ -10,7 +10,18 @@
  */
 import { confirm, Menu, Plugin, Setting, showMessage } from "siyuan";
 import { copyExportedAssets, writeExportedIndex } from "./adapters/fs";
-import { exportPushBundle, resolveGitBinary, verifyGitRepository } from "./adapters/git";
+import {
+  exportPushBundle,
+  publishPublicSnapshot,
+  resolveGitBinary,
+  verifyGitRepository,
+} from "./adapters/git";
+import {
+  resolveHugoBinary,
+  resolvePagefindBinary,
+  runHugoBuild,
+  runPagefindIndex,
+} from "./adapters/build";
 import { hasActiveDocument, NoActiveDocumentError, readCurrentDocumentSnapshot } from "./adapters/siyuan";
 import {
   DEFAULT_PLUGIN_CONFIG,
@@ -99,7 +110,7 @@ function stringifyOptions(options: string[]): string {
  * 当前版本提供：自定义顶栏图标 + 合并导出入口 + 配置页 + dry-run / 正式导出。
  */
 export default class HugoExporterPlugin extends Plugin {
-  private static readonly VERSION = "0.2.5";
+  private static readonly VERSION = "0.3.0";
   private config: HugoExporterConfig = DEFAULT_PLUGIN_CONFIG;
   /** lastForms 是按 docId 缓存的最近一次表单填写值；新结构含 lastAccessedAt 时间戳。 */
   private lastForms: LastFormsMap = {};
@@ -271,6 +282,15 @@ export default class HugoExporterPlugin extends Plugin {
       gitBranch?: HTMLInputElement;
       commitMessage?: HTMLInputElement;
       pullBeforePush?: HTMLInputElement;
+      // 站点发布
+      autoPublishEnabled?: HTMLInputElement;
+      hugoBinary?: HTMLInputElement;
+      hugoArgs?: HTMLTextAreaElement;
+      pagefindEnabled?: HTMLInputElement;
+      pagefindBinary?: HTMLInputElement;
+      publishRepoUrl?: HTMLInputElement;
+      publishBranch?: HTMLInputElement;
+      publishCNAME?: HTMLInputElement;
     } = {};
 
     this.setting = new Setting({
@@ -301,6 +321,14 @@ export default class HugoExporterPlugin extends Plugin {
           commitMessageTemplate:
             inputs.commitMessage?.value.trim() || fallback.commitMessageTemplate,
           pullBeforePush: inputs.pullBeforePush?.checked ?? fallback.pullBeforePush,
+          autoPublishEnabled: inputs.autoPublishEnabled?.checked ?? fallback.autoPublishEnabled,
+          hugoBinary: inputs.hugoBinary?.value.trim() ?? fallback.hugoBinary,
+          hugoArgs: inputs.hugoArgs ? parseLinesToOptions(inputs.hugoArgs.value) : fallback.hugoArgs,
+          pagefindEnabled: inputs.pagefindEnabled?.checked ?? fallback.pagefindEnabled,
+          pagefindBinary: inputs.pagefindBinary?.value.trim() ?? fallback.pagefindBinary,
+          publishRepoUrl: inputs.publishRepoUrl?.value.trim() ?? fallback.publishRepoUrl,
+          publishBranch: inputs.publishBranch?.value.trim() || fallback.publishBranch,
+          publishCNAME: inputs.publishCNAME?.value.trim() ?? fallback.publishCNAME,
         });
         // NOTE: A4 — saveData 失败必须告知魔尊，避免"保存了实际没落盘"。
         this.saveData(STORAGE_NAME, this.config).then(
@@ -537,8 +565,88 @@ export default class HugoExporterPlugin extends Plugin {
       },
     });
 
-    // ------ 维护操作 ------
-    sectionHeader("【四】维护", "重置配置等不常用操作");
+    // ------ 五、站点发布（一键到公开 Pages 仓库） ------
+    sectionHeader(
+      "【五】站点发布（一键到公开 Pages 仓库）",
+      "可选；启用后导出并推送会自动跑 hugo build → pagefind → 强推 public/ 到公开仓库",
+    );
+    safeAddItem({
+      title: "启用一键发布",
+      description:
+        "开启后「导出并推送」流程末尾会自动构建并发布到下方 publishRepoUrl。关闭则只推源码到私有仓库。",
+      build: () => {
+        inputs.autoPublishEnabled = createCheckbox(this.config.autoPublishEnabled);
+        return inputs.autoPublishEnabled;
+      },
+    });
+
+    safeAddItem({
+      title: "Hugo 可执行路径",
+      description: "留空则自动从 PATH 探测；如本机 hugo 不在 PATH，可填绝对路径，例如 I:/SoftWare/hugo/hugo.exe。",
+      build: () => {
+        inputs.hugoBinary = createTextInput(this.config.hugoBinary);
+        return inputs.hugoBinary;
+      },
+    });
+
+    safeAddItem({
+      title: "Hugo build 参数",
+      description: "每行一个参数。默认 --gc / --minify / --enableGitInfo=false（避免缺 git 时 hugo 崩）。",
+      build: () => {
+        inputs.hugoArgs = createMultilineInput(stringifyOptions(this.config.hugoArgs), 4);
+        return inputs.hugoArgs;
+      },
+    });
+
+    safeAddItem({
+      title: "构建 Pagefind 索引",
+      description: "开启后 hugo build 完成会用 pagefind 在 public/ 上构建全文搜索索引。",
+      build: () => {
+        inputs.pagefindEnabled = createCheckbox(this.config.pagefindEnabled);
+        return inputs.pagefindEnabled;
+      },
+    });
+
+    safeAddItem({
+      title: "Pagefind 可执行路径",
+      description:
+        "留空则尝试 <repo>/node_modules/@pagefind/<platform>/bin/pagefind_extended.exe，再回退 PATH。",
+      build: () => {
+        inputs.pagefindBinary = createTextInput(this.config.pagefindBinary);
+        return inputs.pagefindBinary;
+      },
+    });
+
+    safeAddItem({
+      title: "公开仓库 URL",
+      description:
+        "GitHub Pages 公开仓库的 https 地址，例如 https://github.com/<owner>/<owner>.github.io.git。仅支持 https://github.com/。",
+      build: () => {
+        inputs.publishRepoUrl = createTextInput(this.config.publishRepoUrl);
+        return inputs.publishRepoUrl;
+      },
+    });
+
+    safeAddItem({
+      title: "公开仓库分支",
+      description: "默认 main。每次发布会强推（force）覆盖该分支。",
+      build: () => {
+        inputs.publishBranch = createTextInput(this.config.publishBranch);
+        return inputs.publishBranch;
+      },
+    });
+
+    safeAddItem({
+      title: "自定义域名（CNAME）",
+      description: "可空。若用了自定义域名（例如 lpppp.xyz），填进来，每次发布都会写入 public/CNAME 保留绑定。",
+      build: () => {
+        inputs.publishCNAME = createTextInput(this.config.publishCNAME);
+        return inputs.publishCNAME;
+      },
+    });
+
+    // ------ 六、维护操作 ------
+    sectionHeader("【六】维护", "重置配置等不常用操作");
     safeAddItem({
       title: "加载示例候选项",
       description: "把通用示例（如 技术 / 随笔 / 教程 等）合并到 categories/tags 候选中，初次安装快速上手。已存在的不重复添加。",
@@ -775,6 +883,17 @@ export default class HugoExporterPlugin extends Plugin {
         progress.addStep({ id: "git-push", label: `git push ${this.config.gitRemote}/${this.config.gitBranch}` });
       }
 
+      // NOTE: 站点发布阶段（v0.3.0）— 仅在魔尊点了「导出并推送」且开启 autoPublishEnabled 时执行。
+      //       一次性把 hugo build / pagefind / 推 public 三步注册到进度对话框。
+      const willPublish = !!(outcome.push && this.config.autoPublishEnabled && this.config.publishRepoUrl);
+      if (willPublish) {
+        progress.addStep({ id: "publish-build", label: "本地 hugo build" });
+        if (this.config.pagefindEnabled) {
+          progress.addStep({ id: "publish-pagefind", label: "构建 pagefind 索引" });
+        }
+        progress.addStep({ id: "publish-push", label: `推 public/ 到 ${this.config.publishRepoUrl}` });
+      }
+
       stage = "write";
       stagePath = result.manifest.target;
       progress.update("write", "running", result.manifest.target);
@@ -827,8 +946,8 @@ export default class HugoExporterPlugin extends Plugin {
         bundleRelativeDir: dirnameRelative(result.manifest.target),
       };
       const pushSummary = await this.runGitPush(progress, pushParams);
-      progress.finalize(pushSummary.ok, pushSummary.text);
       if (!pushSummary.ok) {
+        progress.finalize(false, pushSummary.text);
         // NOTE: B2 — 失败时给一个"仅重试推送"按钮，魔尊修好凭据/网络后一键再试。
         const retry = async (): Promise<void> => {
           if (!progress) return;
@@ -846,6 +965,36 @@ export default class HugoExporterPlugin extends Plugin {
           }
         };
         progress.setActionButton({ label: "仅重试推送", onClick: () => void retry() });
+        return;
+      }
+
+      // 推源码成功后，按需做"一键发布"：本地 hugo build → pagefind → 推 public/。
+      if (!willPublish) {
+        progress.finalize(true, pushSummary.text);
+        return;
+      }
+
+      stage = "git";
+      stagePath = "publish";
+      const publishOk = await this.runPublishPipeline(progress);
+      if (publishOk.ok) {
+        progress.finalize(true, `${pushSummary.text}；${publishOk.text}`);
+      } else {
+        progress.finalize(false, `源码已 push，但站点发布失败：${publishOk.text}`);
+        // 站点发布失败时给个"仅重试发布"按钮，避免重写文章。
+        const retryPublish = async (): Promise<void> => {
+          if (!progress) return;
+          progress.setActionButton(null);
+          progress.update("publish-build", "pending", "");
+          if (this.config.pagefindEnabled) progress.update("publish-pagefind", "pending", "");
+          progress.update("publish-push", "pending", "");
+          const retry = await this.runPublishPipeline(progress);
+          progress.finalize(retry.ok, retry.ok ? `${pushSummary.text}；${retry.text}` : `源码已 push，但站点发布失败：${retry.text}`);
+          if (!retry.ok) {
+            progress.setActionButton({ label: "仅重试发布", onClick: () => void retryPublish() });
+          }
+        };
+        progress.setActionButton({ label: "仅重试发布", onClick: () => void retryPublish() });
       }
     } catch (error) {
       // NOTE: NoActiveDocumentError 是业务级"未开文档"错误，给极简友好提示，不进度对话框。
@@ -1173,6 +1322,88 @@ export default class HugoExporterPlugin extends Plugin {
       result.push(trimmed);
     }
     return result;
+  }
+
+  /**
+   * runPublishPipeline 执行"hugo build → pagefind → 推 public/"完整链路。
+   * 输入：进度对话框句柄。
+   * 返回：{ ok, text }；text 是单行可放 toast / finalize 的摘要。
+   *
+   * 安全说明：
+   * - hugo binary / pagefind binary 由 build adapter 解析（不存在时已有降级）；
+   * - public/ 路径恒为 <repoRoot>/public，写入前 build adapter 已校验在 repoRoot 内；
+   * - publishPublicSnapshot 内部强制只接受 https://github.com/.../... 形式的 URL。
+   */
+  private async runPublishPipeline(progress: ProgressDialog): Promise<{ ok: boolean; text: string }> {
+    const repoRoot = this.config.repoRoot;
+    if (!repoRoot) {
+      return { ok: false, text: "Hugo 仓库路径未配置，无法构建" };
+    }
+
+    // 1. hugo build
+    progress.update("publish-build", "running");
+    const hugoBinary = await resolveHugoBinary(this.config.hugoBinary);
+    const buildResult = await runHugoBuild({
+      binary: hugoBinary,
+      repoRoot,
+      args: this.config.hugoArgs,
+      cleanPublicFirst: true,
+    });
+    const buildTail = (buildResult.stderr || buildResult.stdout || "").split(/\r?\n/).filter((l) => l.trim()).slice(-1)[0] ?? "";
+    if (buildResult.stdout) progress.appendLog(`[hugo stdout] ${buildResult.stdout.trim()}`);
+    if (buildResult.stderr) progress.appendLog(`[hugo stderr] ${buildResult.stderr.trim()}`);
+    if (!buildResult.ok) {
+      progress.update("publish-build", "fail", buildTail || "hugo build 失败");
+      return { ok: false, text: `hugo build 失败：${buildTail || "见日志"}` };
+    }
+    progress.update("publish-build", "ok", buildTail || `hugo binary=${hugoBinary}`);
+
+    // 2. pagefind 索引（可选）
+    if (this.config.pagefindEnabled) {
+      progress.update("publish-pagefind", "running");
+      const pagefindBinary = await resolvePagefindBinary(this.config.pagefindBinary, repoRoot);
+      const pfResult = await runPagefindIndex({ binary: pagefindBinary, repoRoot });
+      const pfTail = (pfResult.stderr || pfResult.stdout || "").split(/\r?\n/).filter((l) => l.trim()).slice(-1)[0] ?? "";
+      if (pfResult.stdout) progress.appendLog(`[pagefind stdout] ${pfResult.stdout.trim()}`);
+      if (pfResult.stderr) progress.appendLog(`[pagefind stderr] ${pfResult.stderr.trim()}`);
+      if (!pfResult.ok) {
+        progress.update("publish-pagefind", "fail", pfTail || "pagefind 失败");
+        return { ok: false, text: `pagefind 失败：${pfTail || "见日志"}` };
+      }
+      progress.update("publish-pagefind", "ok", pfTail || `pagefind binary=${pagefindBinary}`);
+    }
+
+    // 3. 把 public/ 强推到公开仓库
+    progress.update("publish-push", "running");
+    const gitBinary = await resolveGitBinary(this.config.gitBinary);
+    const publicDir = `${repoRoot.replaceAll("\\", "/").replace(/\/+$/g, "")}/public`;
+    const commitMessage = `deploy: ${new Date().toISOString().slice(0, 19).replace("T", " ")} from siyuan-plugin-hugo-exporter`;
+    const publishResult = await publishPublicSnapshot({
+      binary: gitBinary,
+      publicDir,
+      repoUrl: this.config.publishRepoUrl,
+      branch: this.config.publishBranch || "main",
+      commitMessage,
+      cname: this.config.publishCNAME,
+      addNoJekyll: true,
+    });
+    if (!publishResult.ok) {
+      progress.update("publish-push", "fail", publishResult.errorMessage || "git push 失败");
+      return {
+        ok: false,
+        text: `推送 public/ 失败（${publishResult.failedStep ?? "?"}）：${publishResult.errorMessage ?? ""}`,
+      };
+    }
+    const shaShort = publishResult.commitSha ? publishResult.commitSha.slice(0, 7) : "";
+    progress.update(
+      "publish-push",
+      "ok",
+      shaShort ? `${this.config.publishRepoUrl} · ${shaShort}` : this.config.publishRepoUrl,
+    );
+    return {
+      ok: true,
+      text: `站点已发布到 ${this.config.publishRepoUrl}${shaShort ? ` · ${shaShort}` : ""}`,
+    };
   }
 
   /**
