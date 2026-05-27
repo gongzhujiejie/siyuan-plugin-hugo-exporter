@@ -10,7 +10,7 @@
  * - public/ 目录路径必须在 repoRoot 内，使用 path.relative 校验；
  * - 任何二进制路径绝不来自非配置来源，配置层的字符串守护已在 mergePluginConfig 完成。
  */
-import { rm } from "node:fs/promises";
+import { access, rm } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 
 // SPLICE_1_TYPES
@@ -154,11 +154,17 @@ const WINDOWS_HUGO_FALLBACKS = [
   "C:/tools/hugo/hugo.exe",
 ];
 
-/** canAccess 探测路径是否可读。失败一律视为"不可用"。 */
+/**
+ * canAccess 探测路径是否可读。失败一律视为"不可用"。
+ *
+ * NOTE: 必须用顶层 import 的 access，不能用 dynamic import("node:fs/promises")。
+ *       在思源 Electron renderer 下 dynamic import("node:...") 会失败（对应模块不会被
+ *       浏览器 ESM 解析器认作内置），导致所有候选都被判定为不存在，pagefind 找不到。
+ *       这一点已经在 git adapter 上得到验证 —— 顶层 import 没问题，dynamic import 不行。
+ */
 async function canAccess(path: string): Promise<boolean> {
   try {
-    const fs = await import("node:fs/promises");
-    await fs.access(path);
+    await access(path);
     return true;
   } catch {
     return false;

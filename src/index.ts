@@ -9,6 +9,7 @@
  * 内部完成 addItem，否则思源集市卡片不会出现齿轮按钮。
  */
 import { confirm, Menu, Plugin, Setting, showMessage } from "siyuan";
+import { access } from "node:fs/promises";
 import { copyExportedAssets, writeExportedIndex } from "./adapters/fs";
 import {
   exportPushBundle,
@@ -110,7 +111,7 @@ function stringifyOptions(options: string[]): string {
  * 当前版本提供：自定义顶栏图标 + 合并导出入口 + 配置页 + dry-run / 正式导出。
  */
 export default class HugoExporterPlugin extends Plugin {
-  private static readonly VERSION = "0.3.1";
+  private static readonly VERSION = "0.3.2";
   private config: HugoExporterConfig = DEFAULT_PLUGIN_CONFIG;
   /** lastForms 是按 docId 缓存的最近一次表单填写值；新结构含 lastAccessedAt 时间戳。 */
   private lastForms: LastFormsMap = {};
@@ -1084,11 +1085,15 @@ export default class HugoExporterPlugin extends Plugin {
     return `${root}/${rel}`;
   }
 
-  /** fileExists 通过 fs/promises 探测文件是否存在；任何异常都返回 false。 */
+  /**
+   * fileExists 通过 fs/promises 探测文件是否存在；任何异常都返回 false。
+   *
+   * NOTE: 使用顶层 import 的 access。思源 Electron renderer 下 dynamic import("node:...")
+   *       会失败（vite 把它识别为浏览器 ESM），这里走顶层的方式与 git/build adapter 一致。
+   */
   private async fileExists(absolutePath: string): Promise<boolean> {
     try {
-      const fs = await import("node:fs/promises");
-      await fs.access(absolutePath);
+      await access(absolutePath);
       return true;
     } catch {
       return false;

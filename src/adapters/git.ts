@@ -10,8 +10,9 @@
  * - 所有写入路径都先用 path.relative 校验是否在 repoRoot 内，绝不允许 ../ 逃逸。
  * - 不会执行 reset / checkout / push --force / add . 等破坏性命令。
  */
-import { access } from "node:fs/promises";
+import { access, cp, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { delimiter, isAbsolute, join, relative, resolve } from "node:path";
+import { tmpdir } from "node:os";
 
 /** GitCommandResult 是所有 git 调用的统一返回结构。 */
 export interface GitCommandResult {
@@ -481,13 +482,11 @@ export async function publishPublicSnapshot(input: PublishPublicInput): Promise<
     return { ok: false, failedStep: "validate-public", errorMessage: "Hugo public/ 目录路径未提供" };
   }
 
-  const fs = await import("node:fs/promises");
-  const path = await import("node:path");
-  const os = await import("node:os");
-
+  // NOTE: 必须用顶层 import 的 fs / path / os，不能用 dynamic import("node:...")。
+  //       思源 Electron renderer 下 dynamic import 不识别 node: 前缀模块，会落到 catch。
   // 校验 publicDir 存在
   try {
-    await fs.access(input.publicDir);
+    await access(input.publicDir);
   } catch {
     return {
       ok: false,
@@ -496,16 +495,16 @@ export async function publishPublicSnapshot(input: PublishPublicInput): Promise<
     };
   }
 
-  const workRoot = await fs.mkdtemp(path.join(os.tmpdir(), "hugo-publish-"));
+  const workRoot = await mkdtemp(join(tmpdir(), "hugo-publish-"));
   try {
     // 复制 publicDir 全部内容到 workRoot
-    await fs.cp(input.publicDir, workRoot, { recursive: true });
+    await cp(input.publicDir, workRoot, { recursive: true });
 
     if (input.addNoJekyll) {
-      await fs.writeFile(path.join(workRoot, ".nojekyll"), "", "utf8");
+      await writeFile(join(workRoot, ".nojekyll"), "", "utf8");
     }
     if (input.cname && input.cname.trim()) {
-      await fs.writeFile(path.join(workRoot, "CNAME"), input.cname.trim(), "utf8");
+      await writeFile(join(workRoot, "CNAME"), input.cname.trim(), "utf8");
     }
 
     // 顺序跑 git 命令；任一失败即停。
@@ -544,7 +543,7 @@ export async function publishPublicSnapshot(input: PublishPublicInput): Promise<
     };
   } finally {
     try {
-      await fs.rm(workRoot, { recursive: true, force: true });
+      await rm(workRoot, { recursive: true, force: true });
     } catch (cleanupError) {
       // NOTE: 临时目录清理失败不阻断主流程，仅 console 警告。
       console.warn("[hugo-exporter] cleanup publish workspace failed", cleanupError);
