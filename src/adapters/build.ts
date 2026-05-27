@@ -154,13 +154,6 @@ const WINDOWS_HUGO_FALLBACKS = [
   "C:/tools/hugo/hugo.exe",
 ];
 
-/** isWindowsRuntime 与 git adapter 中的同名函数语义相同，避免顶层 require('node:os')。 */
-function isWindowsRuntime(): boolean {
-  const platformValue = typeof process !== "undefined" ? process.platform : "";
-  const userAgent = typeof navigator !== "undefined" ? navigator.userAgent : "";
-  return platformValue === "win32" || /windows/i.test(userAgent);
-}
-
 /** canAccess 探测路径是否可读。失败一律视为"不可用"。 */
 async function canAccess(path: string): Promise<boolean> {
   try {
@@ -176,12 +169,19 @@ async function canAccess(path: string): Promise<boolean> {
 async function findInPath(name: string): Promise<string | null> {
   const pathEnv = process.env.PATH ?? "";
   if (!pathEnv) return null;
-  const exts = isWindowsRuntime() ? (process.env.PATHEXT ?? ".EXE;.CMD;.BAT").split(";") : [""];
-  const sep = isWindowsRuntime() ? ";" : ":";
-  for (const dir of pathEnv.split(sep)) {
-    if (!dir) continue;
+  // NOTE: 思源 Electron 渲染进程里 process.platform 可能不可靠；
+  //       两种分隔符都试，两组扩展名都试，确保 Windows 与 Unix 都能命中。
+  const exts = [".exe", ".cmd", ".bat", ""];
+  const separators = [";", ":"];
+  const dirs = new Set<string>();
+  for (const sep of separators) {
+    for (const dir of pathEnv.split(sep)) {
+      if (dir) dirs.add(dir);
+    }
+  }
+  for (const dir of dirs) {
     for (const ext of exts) {
-      const candidate = join(dir, `${name}${ext.toLowerCase()}`);
+      const candidate = join(dir, `${name}${ext}`);
       if (await canAccess(candidate)) return candidate;
     }
   }
@@ -192,6 +192,9 @@ async function findInPath(name: string): Promise<string | null> {
  * resolveHugoBinary 解析 hugo 可执行文件最终路径。
  * 输入：用户配置 binary（可能为空）。
  * 返回：可被 spawn 直接识别的命令名或绝对路径；最坏情况返回 "hugo"。
+ *
+ * 与 pagefind 同理：思源 Electron 渲染进程里 process.platform 可能不可靠，
+ * 所以 PATH 探测时尝试带 .exe / 不带 两种文件名。
  */
 export async function resolveHugoBinary(binary: string): Promise<string> {
   const trimmed = (binary ?? "").trim();
@@ -205,10 +208,9 @@ export async function resolveHugoBinary(binary: string): Promise<string> {
   }
   const fromPath = await findInPath("hugo");
   if (fromPath) return fromPath;
-  if (isWindowsRuntime()) {
-    for (const candidate of WINDOWS_HUGO_FALLBACKS) {
-      if (await canAccess(candidate)) return candidate;
-    }
+  // Windows fallback：常见安装路径，外加 .exe / 无后缀都试一遍
+  for (const candidate of WINDOWS_HUGO_FALLBACKS) {
+    if (await canAccess(candidate)) return candidate;
   }
   return "hugo";
 }
@@ -220,6 +222,10 @@ export async function resolveHugoBinary(binary: string): Promise<string> {
  *   2. <repoRoot>/node_modules/@pagefind/{platform}/bin/pagefind_extended[.exe]；
  *   3. PATH 中的 pagefind；
  *   4. 兜底返回 "pagefind"，由 spawn 报错。
+ *
+ * 实现细节：思源 Electron 渲染进程里 process.platform 可能为空字符串，
+ *           导致 isWindowsRuntime 误判，无法拼上 .exe 扩展名 → 找不到 Windows 版本的 pagefind。
+ *           解决：候选列表把 ".exe" 与 "" 两种后缀都试一遍。
  */
 export async function resolvePagefindBinary(binary: string, repoRoot: string): Promise<string> {
   const trimmed = (binary ?? "").trim();
@@ -230,16 +236,22 @@ export async function resolvePagefindBinary(binary: string, repoRoot: string): P
       return trimmed;
     }
   }
-  // 在 repoRoot 下尝试常见 node_modules 路径
+  // 在 repoRoot 下尝试常见 node_modules 路径；同时尝试 .exe 与无扩展，覆盖判断不到 platform 的场景。
   if (repoRoot) {
-    const exe = isWindowsRuntime() ? ".exe" : "";
-    const candidates = [
-      join(repoRoot, "node_modules", "@pagefind", "windows-x64", "bin", `pagefind_extended${exe}`),
-      join(repoRoot, "node_modules", "@pagefind", "linux-x64", "bin", `pagefind_extended${exe}`),
-      join(repoRoot, "node_modules", "@pagefind", "darwin-x64", "bin", `pagefind_extended${exe}`),
-      join(repoRoot, "node_modules", "@pagefind", "darwin-arm64", "bin", `pagefind_extended${exe}`),
-      join(repoRoot, "node_modules", ".bin", `pagefind${exe}`),
-    ];
+    const platforms = ["windows-x64", "windows-arm64", "linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64"];
+    const suffixes = [".exe", ""];
+    const candidates: string[] = [];
+    for (const platform of platforms) {
+      for (const suffix of suffixes) {
+        candidates.push(
+          join(repoRoot, "node_modules", "@pagefind", platform, "bin", `pagefind_extended${suffix}`),
+          join(repoRoot, "node_modules", "@pagefind", platform, "bin", `pagefind${suffix}`),
+        );
+      }
+    }
+    for (const suffix of suffixes) {
+      candidates.push(join(repoRoot, "node_modules", ".bin", `pagefind${suffix}`));
+    }
     for (const candidate of candidates) {
       if (await canAccess(candidate)) return candidate;
     }
