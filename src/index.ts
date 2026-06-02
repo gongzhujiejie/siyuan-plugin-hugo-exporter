@@ -8,8 +8,8 @@
  * NOTE: 在 onload 中先 addIcons 再 addTopBar；Setting 必须在 onload 同步执行
  * 内部完成 addItem，否则思源集市卡片不会出现齿轮按钮。
  */
-import { confirm, Menu, Plugin, Setting, showMessage } from "siyuan";
-import { access } from "node:fs/promises";
+import { confirm, Dialog, Menu, Plugin, Setting, showMessage } from "siyuan";
+import { access, readdir, readFile } from "node:fs/promises";
 import { copyExportedAssets, writeExportedIndex } from "./adapters/fs";
 import {
   exportPushBundle,
@@ -17,6 +17,12 @@ import {
   resolveGitBinary,
   verifyGitRepository,
 } from "./adapters/git";
+import {
+  performBlogManagementGitPush,
+  removePostBundle,
+  writePostIndex,
+  type BlogManagementAction,
+} from "./adapters/blogManagement";
 import {
   resolveHugoBinary,
   resolvePagefindBinary,
@@ -35,6 +41,7 @@ import {
   renderCommitMessage,
 } from "./config";
 import { exportHugoPost } from "./core/exportPipeline";
+import { scanBlogPosts, setPostDraft, type BlogPostEntry } from "./core/blogManager";
 import {
   estimateLastFormsBytes,
   type LastFormsMap,
@@ -42,6 +49,7 @@ import {
   pruneLastForms,
 } from "./core/lastForms";
 import { openFrontmatterEditor } from "./ui/frontmatterEditor";
+import { openBlogManagerDialog, type BlogManagerEntry } from "./ui/blogManagerDialog";
 import { openProgressDialog, type ProgressDialog } from "./ui/progressDialog";
 
 const STORAGE_NAME = "hugo-exporter-config.json";
@@ -231,6 +239,14 @@ export default class HugoExporterPlugin extends Plugin {
       label: "Hugo：导出当前文档",
       click: () => {
         void this.runExport();
+      },
+    });
+
+    menu.addItem({
+      icon: "iconFiles",
+      label: "Hugo：管理博客文章",
+      click: () => {
+        void this.runBlogManager();
       },
     });
 
@@ -1021,6 +1037,194 @@ export default class HugoExporterPlugin extends Plugin {
         progress.appendLog(`[error ${stage}] ${stagePath ? `${stagePath} · ` : ""}${message}`);
         progress.finalize(false, decoratedMessage);
       }
+    }
+  }
+
+  /**
+   * runBlogManager 扫描 Hugo 仓库中的 leaf bundle，并打开博客文章管理弹窗。
+   * 行为：只读取 <repoRoot>/<contentDir> 下的 index.md；真实上下架/删除动作由弹窗回调触发。
+   */
+  private async runBlogManager(): Promise<void> {
+    if (!this.config.repoRoot.trim()) {
+      showMessage("请先在设置中配置 Hugo 仓库路径，再管理博客文章。");
+      return;
+    }
+
+    try {
+      const files = await this.listBlogIndexFiles();
+      const posts = await scanBlogPosts({
+        repoRoot: this.config.repoRoot,
+        contentDir: this.config.contentDir,
+        reader: {
+          listFiles: () => files,
+          readFile: async (relativePath: string) =>
+            readFile(await this.resolveAbsolutePath(this.config.repoRoot, relativePath), "utf8"),
+        },
+      });
+
+      const entries = posts.map((post) => this.toBlogManagerEntry(post));
+      openBlogManagerDialog(entries, {
+        DialogClass: Dialog as never,
+        onUnpublish: (entry) => void this.runBlogManagementAction("unpublish", entry),
+        onRepublish: (entry) => void this.runBlogManagementAction("republish", entry),
+        onDelete: (entry) => void this.runBlogManagementAction("delete", entry),
+      });
+      showMessage(`已扫描 ${entries.length} 篇 Hugo 文章`);
+    } catch (error) {
+      console.error("[hugo-exporter] blog manager open failed", error);
+      showMessage(`打开博客管理失败：${this.formatError(error)}`);
+    }
+  }
+
+  /** listBlogIndexFiles 递归枚举 contentDir 下所有 index.md，返回相对 repoRoot 的路径。 */
+  private async listBlogIndexFiles(): Promise<string[]> {
+    const contentDir = this.config.contentDir.replaceAll("\\", "/").replace(/^\/+|\/+$/g, "");
+    const contentRoot = await this.resolveAbsolutePath(this.config.repoRoot, contentDir);
+    const result: string[] = [];
+
+    const walk = async (absoluteDir: string, relativeDir: string): Promise<void> => {
+      const entries = await readdir(absoluteDir, { withFileTypes: true });
+      for (const entry of entries) {
+        const absolutePath = `${absoluteDir.replaceAll("\\", "/").replace(/\/+$/g, "")}/${entry.name}`;
+        const relativePath = `${relativeDir.replace(/\/+$/g, "")}/${entry.name}`.replace(/^\/+/, "");
+        if (entry.isDirectory()) {
+          await walk(absolutePath, relativePath);
+        } else if (entry.isFile() && entry.name.toLowerCase() === "index.md") {
+          result.push(relativePath.replaceAll("\\", "/"));
+        }
+      }
+    };
+
+    await walk(contentRoot, contentDir);
+    return result.sort((a, b) => a.localeCompare(b));
+  }
+
+  /** toBlogManagerEntry 把核心扫描结果适配为 UI 需要的字段。 */
+  private toBlogManagerEntry(post: BlogPostEntry): BlogManagerEntry {
+    const slug = post.slug?.trim() || post.bundleDir.split("/").filter(Boolean).at(-1) || "untitled";
+    return {
+      title: post.title,
+      slug,
+      relativeIndexPath: post.indexPath,
+      bundleRelativeDir: post.bundleDir,
+      status: post.status,
+      date: post.date ?? "",
+    };
+  }
+
+  /** runBlogManagementAction 执行下架、恢复或删除，并按配置提交推送、自动发布站点。 */
+  private async runBlogManagementAction(action: BlogManagementAction, entry: BlogManagerEntry): Promise<void> {
+    const actionLabel: Record<BlogManagementAction, string> = {
+      unpublish: "下架文章",
+      republish: "恢复上架",
+      delete: "删除文章",
+    };
+    const progress = openProgressDialog(`Hugo ${actionLabel[action]}`);
+    progress.addStep({ id: "blog-action", label: actionLabel[action] });
+
+    const shouldGitPush = this.config.gitEnabled;
+    if (shouldGitPush) {
+      progress.addStep({ id: "git-binary", label: "解析 git 路径" });
+      progress.addStep({ id: "git-verify", label: "验证仓库（rev-parse）" });
+      if (this.config.pullBeforePush) {
+        progress.addStep({ id: "git-pull", label: `pull --rebase ${this.config.gitRemote}/${this.config.gitBranch}` });
+      }
+      progress.addStep({ id: "git-status", label: "git status（检测变更）" });
+      progress.addStep({ id: "git-add", label: "git add 管理目标" });
+      progress.addStep({ id: "git-commit", label: "git commit" });
+      progress.addStep({ id: "git-push", label: `git push ${this.config.gitRemote}/${this.config.gitBranch}` });
+    }
+
+    const willPublish = !!(shouldGitPush && this.config.autoPublishEnabled && this.config.publishRepoUrl);
+    if (willPublish) {
+      progress.addStep({ id: "publish-build", label: "本地 hugo build" });
+      if (this.config.pagefindEnabled) progress.addStep({ id: "publish-pagefind", label: "构建 pagefind 索引" });
+      progress.addStep({ id: "publish-push", label: `推 public/ 到 ${this.config.publishRepoUrl}` });
+    }
+
+    try {
+      progress.update("blog-action", "running", entry.relativeIndexPath);
+      if (action === "delete") {
+        await removePostBundle(this.config.repoRoot, entry.bundleRelativeDir);
+        progress.update("blog-action", "ok", entry.bundleRelativeDir);
+      } else {
+        const current = await readFile(await this.resolveAbsolutePath(this.config.repoRoot, entry.relativeIndexPath), "utf8");
+        const updated = setPostDraft(current, action === "unpublish");
+        await writePostIndex(this.config.repoRoot, entry.relativeIndexPath, updated);
+        progress.update("blog-action", "ok", action === "unpublish" ? "draft: true" : "draft: false");
+      }
+
+      if (!shouldGitPush) {
+        const text = `${actionLabel[action]}完成：仅修改本地 Hugo 仓库，未执行 git 推送`;
+        progress.finalize(true, text);
+        showMessage(text);
+        return;
+      }
+
+      progress.update("git-binary", "running");
+      const binary = await resolveGitBinary(this.config.gitBinary);
+      progress.update("git-binary", "ok", binary);
+      const gitResult = await performBlogManagementGitPush({
+        binary,
+        repoRoot: this.config.repoRoot,
+        bundleRelativeDir: action === "delete" ? entry.bundleRelativeDir : undefined,
+        indexPath: action === "delete" ? undefined : entry.relativeIndexPath,
+        action,
+        slug: entry.slug,
+        remote: this.config.gitRemote,
+        branch: this.config.gitBranch,
+        pullBeforePush: this.config.pullBeforePush,
+      });
+      this.renderGitSteps(progress, gitResult.steps);
+      if (gitResult.ok && !gitResult.committed) {
+        progress.update("git-add", "ok", "工作区无变更，已跳过");
+        progress.update("git-commit", "ok", "工作区无变更，已跳过");
+      }
+      if (!gitResult.ok) {
+        const text = `${actionLabel[action]}失败（${gitResult.failedStep ?? "git"}）：${gitResult.errorMessage ?? "未知 git 错误"}`;
+        progress.finalize(false, text);
+        showMessage(text);
+        return;
+      }
+
+      if (!willPublish) {
+        const text = `${actionLabel[action]}完成并已推送：${this.config.gitRemote}/${this.config.gitBranch}`;
+        progress.finalize(true, text);
+        showMessage(text);
+        return;
+      }
+
+      const publish = await this.runPublishPipeline(progress);
+      const text = publish.ok
+        ? `${actionLabel[action]}完成并已发布：${publish.text}`
+        : `${actionLabel[action]}已推送，但发布失败：${publish.text}`;
+      progress.finalize(publish.ok, text);
+      showMessage(text);
+    } catch (error) {
+      const text = `${actionLabel[action]}异常：${this.formatError(error)}`;
+      progress.update("blog-action", "fail", this.formatError(error));
+      progress.finalize(false, text);
+      showMessage(text);
+    }
+  }
+
+  /** renderGitSteps 把博客管理 git 适配层返回的步骤映射到进度弹窗。 */
+  private renderGitSteps(progress: ProgressDialog, steps: { name: string; result: { ok: boolean; stdout: string; stderr: string } }[]): void {
+    const stepIdByName: Record<string, string> = {
+      "verify-repo": "git-verify",
+      "pull-rebase": "git-pull",
+      status: "git-status",
+      add: "git-add",
+      commit: "git-commit",
+      push: "git-push",
+    };
+    for (const step of steps) {
+      const id = stepIdByName[step.name];
+      if (!id) continue;
+      const tail = (step.result.stderr || step.result.stdout || "").split(/\r?\n/).filter((line) => line.trim()).slice(-1)[0] ?? "";
+      progress.update(id, step.result.ok ? "ok" : "fail", tail || `git ${step.name} ${step.result.ok ? "完成" : "失败"}`);
+      if (step.result.stdout) progress.appendLog(`[git ${step.name} stdout] ${step.result.stdout.trim()}`);
+      if (step.result.stderr) progress.appendLog(`[git ${step.name} stderr] ${step.result.stderr.trim()}`);
     }
   }
 
