@@ -11,7 +11,7 @@ import type { FrontmatterFieldConfig } from "../core/types";
 import { slugifyTitle } from "../core/slug";
 
 /** COMMON_FIELD_KEYS 控制默认展开的常用字段顺序。 */
-export const COMMON_FIELD_KEYS = ["title", "categories", "tags", "description", "draft"];
+export const COMMON_FIELD_KEYS = ["title", "categories", "tags", "description", "featuredImage", "draft"];
 
 /**
  * parseArrayInput 把 textarea 或自由输入里的数组文本解析成稳定数组。
@@ -118,4 +118,46 @@ export function mergeOptionValues(options: string[], current: string[]): string[
     result.push(item);
   }
   return result;
+}
+
+/**
+ * resolveImagePreviewUrl 把 frontmatter / 正文里写的"图片地址"换算成浏览器能加载的预览 URL。
+ *
+ * 输入：
+ *   - raw: 原始字符串。可能是远端 URL、思源 assets/xxx.png、file://、Windows 绝对路径，或 bundle 内 images/xxx。
+ *   - assetBasePath: 可选；通常是思源 workspace 的 data 目录（绝对路径）。仅在魔尊填的是相对路径而我们想用 file:// 兜底时才用得到。
+ *
+ * 返回：
+ *   - 浏览器能直接 set 到 <img src> 的字符串；无法预览时返回空串，让 UI 隐藏 thumbnail。
+ *
+ * 行为：
+ *   - 远端协议（http/https/data:/blob:）→ 原样返回。
+ *   - file:// → 原样返回。
+ *   - Windows 绝对路径（如 D:/foo.png）→ 拼成 file:///D:/foo.png。
+ *   - 思源 assets/... → 思源 kernel 把 /assets/<path> 直接映射到 workspace 的 data/assets，所以返回前缀斜杠版本即可。
+ *   - 其它相对路径（如 bundle 内 images/foo.png）→ 浏览器无法访问 hugo 仓库，返回空串。
+ */
+export function resolveImagePreviewUrl(raw: string, assetBasePath?: string): string {
+  const value = (raw ?? "").trim();
+  if (!value) return "";
+  if (/^(https?:|data:|blob:)/i.test(value)) return value;
+  if (/^file:/i.test(value)) return value;
+  if (/^[a-zA-Z]:[\\/]/.test(value)) {
+    // Windows 绝对路径：归一化分隔符，并加 file:/// 让浏览器可加载（Electron 渲染层一般允许）。
+    return `file:///${value.replaceAll("\\", "/").replace(/^\/+/, "")}`;
+  }
+  if (/^\//.test(value)) {
+    // POSIX 绝对路径：在思源 webview 里通常解析为 kernel 同源路径，原样返回试试。
+    return value;
+  }
+  if (/^assets[\\/]/i.test(value)) {
+    // 思源 assets/foo.png：以 / 开头让浏览器按 kernel 同源根去取，思源 kernel 会服务到 workspace data/assets。
+    return `/${value.replaceAll("\\", "/")}`;
+  }
+  // bundle 内相对路径（images/cover.png）等 → 没有 base 可拼；如果给了 assetBasePath 当作 file 兜底。
+  if (assetBasePath && assetBasePath.trim()) {
+    const base = assetBasePath.replaceAll("\\", "/").replace(/\/+$/g, "");
+    return `file:///${base}/${value.replaceAll("\\", "/")}`;
+  }
+  return "";
 }

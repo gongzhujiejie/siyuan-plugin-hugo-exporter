@@ -59,4 +59,93 @@ describe("exportHugoPost", () => {
       rewrittenUrl: "images/PixPin_2026-04-27_10-25-12-20260427102514-kze3mcy.png",
     });
   });
+
+  it("copies a featuredImage given as a Windows absolute path and rewrites frontmatter", () => {
+    const result = exportHugoPost({
+      doc: acfunDoc,
+      repoRoot: "I:/my-blog",
+      dryRun: true,
+      now: "2026-05-25T12:00:00+08:00",
+      assetBasePath: "I:/siyuan/workspace/data",
+      frontmatterOverride: {
+        title: "Acfun",
+        date: acfunDoc.createdAt,
+        lastmod: acfunDoc.updatedAt,
+        featuredImage: "D:/covers/cover.png",
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.content).toContain("featuredImage: images/cover.png");
+    expect(result.assetPlans).toEqual([
+      {
+        originalUrl: "D:/covers/cover.png",
+        sourcePath: "D:/covers/cover.png",
+        targetRelativePath: "content/posts/acfun/images/cover.png",
+        rewrittenUrl: "images/cover.png",
+      },
+    ]);
+  });
+
+  it("keeps remote featuredImage URL untouched", () => {
+    const result = exportHugoPost({
+      doc: acfunDoc,
+      repoRoot: "I:/my-blog",
+      dryRun: true,
+      now: "2026-05-25T12:00:00+08:00",
+      frontmatterOverride: {
+        title: "Acfun",
+        date: acfunDoc.createdAt,
+        lastmod: acfunDoc.updatedAt,
+        featuredImage: "https://cdn.example.com/cover.png",
+      },
+    });
+
+    expect(result.assetPlans).toEqual([]);
+    expect(result.content).toContain("featuredImage: https://cdn.example.com/cover.png");
+  });
+
+  it("does not duplicate copy when featuredImage already lives in bundle", () => {
+    const result = exportHugoPost({
+      doc: acfunDoc,
+      repoRoot: "I:/my-blog",
+      dryRun: true,
+      now: "2026-05-25T12:00:00+08:00",
+      frontmatterOverride: {
+        title: "Acfun",
+        date: acfunDoc.createdAt,
+        lastmod: acfunDoc.updatedAt,
+        featuredImage: "images/cover.png",
+      },
+    });
+
+    expect(result.assetPlans).toEqual([]);
+    expect(result.content).toContain("featuredImage: images/cover.png");
+  });
+
+  it("copies featuredImage from siyuan assets/ relative path", () => {
+    const result = exportHugoPost({
+      doc: acfunDoc,
+      repoRoot: "I:/my-blog",
+      dryRun: true,
+      now: "2026-05-25T12:00:00+08:00",
+      assetBasePath: "I:/siyuan/workspace/data",
+      frontmatterOverride: {
+        title: "Acfun",
+        date: acfunDoc.createdAt,
+        lastmod: acfunDoc.updatedAt,
+        featuredImage: "assets/cover.png",
+      },
+    });
+
+    expect(result.content).toContain("featuredImage: images/cover.png");
+    expect(result.assetPlans).toEqual([
+      {
+        originalUrl: "assets/cover.png",
+        sourcePath: "I:/siyuan/workspace/data/assets/cover.png",
+        targetRelativePath: "content/posts/acfun/images/cover.png",
+        rewrittenUrl: "images/cover.png",
+      },
+    ]);
+  });
 });

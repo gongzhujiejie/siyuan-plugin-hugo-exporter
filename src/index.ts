@@ -111,7 +111,7 @@ function stringifyOptions(options: string[]): string {
  * 当前版本提供：自定义顶栏图标 + 合并导出入口 + 配置页 + dry-run / 正式导出。
  */
 export default class HugoExporterPlugin extends Plugin {
-  private static readonly VERSION = "0.3.2";
+  private static readonly VERSION = "0.4.0";
   private config: HugoExporterConfig = DEFAULT_PLUGIN_CONFIG;
   /** lastForms 是按 docId 缓存的最近一次表单填写值；新结构含 lastAccessedAt 时间戳。 */
   private lastForms: LastFormsMap = {};
@@ -808,6 +808,8 @@ export default class HugoExporterPlugin extends Plugin {
         gitEnabled: this.config.gitEnabled,
         gitRemote: this.config.gitRemote,
         gitBranch: this.config.gitBranch,
+        // NOTE: 把思源 assets 根路径传给"封面图"组件，让它能用 file:// 兜底预览相对路径图片。
+        assetBasePath: this.config.assetBasePath || this.config.repoRoot,
         lastValues,
         // NOTE: 用户在弹窗里临时新增的候选项，立即合并到 config 并 saveData，
         //       下次开任意文档都能在 chip 列表里看到。

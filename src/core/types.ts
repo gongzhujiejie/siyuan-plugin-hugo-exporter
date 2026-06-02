@@ -13,7 +13,8 @@ export type FrontmatterFieldType =
   | "datetime"
   | "array"
   | "object"
-  | "enum";
+  | "enum"
+  | "image";
 
 /** FrontmatterSource 描述字段值从哪里来，用于后续 M3 的 UI 映射。 */
 export type FrontmatterSource = "siyuan-attr" | "document" | "manual" | "computed";

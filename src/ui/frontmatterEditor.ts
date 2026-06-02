@@ -19,6 +19,7 @@ import {
   mergeOptionValues,
   parseArrayInput,
   parseObjectInput,
+  resolveImagePreviewUrl,
   splitFrontmatterFields,
   stringifyArray,
   stringifyObject,
@@ -32,6 +33,7 @@ export {
   mergeOptionValues,
   parseArrayInput,
   parseObjectInput,
+  resolveImagePreviewUrl,
   splitFrontmatterFields,
   stringifyArray,
   stringifyObject,
@@ -83,6 +85,16 @@ export interface FrontmatterEditorOptions {
   onRenameOption?: (key: "categories" | "tags" | "collections", oldName: string, newName: string) => void;
   /** onDeleteOption 在用户从候选库永久删除某项时回调。 */
   onDeleteOption?: (key: "categories" | "tags" | "collections", name: string) => void;
+  /**
+   * documentMarkdown 是当前文档的原始 Markdown 内容，用于"封面图字段"组件提取正文已用图片作为候选。
+   * 可选：如果调用方没传，封面图选择器只显示输入框 + 文件选择按钮。
+   */
+  documentMarkdown?: string;
+  /**
+   * assetBasePath 是思源 workspace 的 data 目录绝对路径；用于在"封面图"字段里把相对路径解析成 file:// 兜底预览。
+   * 不影响导出管线的真实拷贝逻辑（管线仍按 export pipeline 自己解析）。
+   */
+  assetBasePath?: string;
 }
 
 interface FieldRow {
@@ -451,6 +463,243 @@ function createSelectableArrayInput(
   return () => selected;
 }
 
+/**
+ * extractMarkdownImageUrls 从一段 Markdown 里抽出所有 `![alt](url)` 图片链接，
+ * 用于"封面图"字段的快速候选 chip。
+ *
+ * 输入：Markdown 原文。
+ * 返回：去重后的图片 URL 数组（保留出现顺序）。
+ */
+function extractMarkdownImageUrls(markdown: string): string[] {
+  if (!markdown) return [];
+  const pattern = /!\[[^\]]*\]\(([^\s)]+)\)/g;
+  const seen = new Set<string>();
+  const result: string[] = [];
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(markdown))) {
+    const url = match[1]?.trim();
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    result.push(url);
+  }
+  return result;
+}
+
+/**
+ * createImagePicker 渲染"封面图"字段的复合控件。
+ *
+ * 输入：
+ *   - valueBox: 容器
+ *   - initialValue: 初始值（来自 lastValues / preset / siyuan-attr）
+ *   - documentMarkdown: 当前文档的 Markdown，用于提取正文图片做候选缩略图卡片
+ *   - assetBasePath: 思源 workspace 的 data 路径，用于把相对路径解析成 file:// 兜底预览
+ *
+ * 返回：读取最终字符串值的函数（字符串可能是远端 URL / 思源 assets/... / Windows 绝对路径 / 已在 bundle 内）。
+ *
+ * 安全说明：
+ *   - 只用 textContent / value 写 DOM；
+ *   - 缩略图 src 直接给字符串，浏览器无法加载就不显示，不会注入 HTML；
+ *   - 不会在选择器内执行用户字符串。
+ */
+function createImagePicker(
+  valueBox: HTMLElement,
+  initialValue: unknown,
+  documentMarkdown: string,
+  assetBasePath: string,
+): () => string {
+  const initial = stringifyScalar(initialValue);
+
+  // 主输入框：纯文本，魔尊也可以手填（含远端 URL / 思源 assets/foo.png / D:/foo.png 等）。
+  const inputRow = document.createElement("div");
+  inputRow.style.cssText = "display:flex;gap:6px;align-items:center";
+
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "b3-text-field fn__block";
+  input.value = initial;
+  input.placeholder = "粘贴 URL，或填 assets/cover.png，或点右侧「本地选图」";
+
+  const fileButton = document.createElement("button");
+  fileButton.type = "button";
+  fileButton.className = "b3-button b3-button--outline";
+  fileButton.textContent = "本地选图";
+  fileButton.title = "弹出系统文件选择器，选完会自动填入绝对路径，导出时一并复制到 bundle/images";
+
+  const clearButton = document.createElement("button");
+  clearButton.type = "button";
+  clearButton.className = "b3-button b3-button--cancel";
+  clearButton.textContent = "清空";
+
+  inputRow.appendChild(input);
+  inputRow.appendChild(fileButton);
+  inputRow.appendChild(clearButton);
+  valueBox.appendChild(inputRow);
+
+  // 提示行：解释封面图最终会去哪里。
+  const hint = document.createElement("div");
+  hint.style.cssText = "color:var(--b3-theme-on-surface-light);font-size:11.5px;margin:4px 0";
+  hint.textContent =
+    "导出时本地图片会自动复制到 <bundle>/images/，frontmatter 写为 images/<文件名>；远端 URL 原样保留。";
+  valueBox.appendChild(hint);
+
+  // 候选卡片网格：来自当前文档 markdown 的图片 URL，每张都是带缩略图的小卡片。
+  // NOTE: 用 grid 而不是 flex-wrap，让每张缩略图固定大小，鼠标视觉对齐更稳定。
+  const candidates = extractMarkdownImageUrls(documentMarkdown);
+  // gridWrap 持有标题 + 网格本体；refreshGridSelection 会高亮当前选中的卡片。
+  let gridWrap: HTMLDivElement | null = null;
+  const cardElements: { url: string; card: HTMLDivElement }[] = [];
+  if (candidates.length > 0) {
+    gridWrap = document.createElement("div");
+    gridWrap.style.cssText = "margin:6px 0";
+
+    const gridLabel = document.createElement("div");
+    gridLabel.style.cssText =
+      "font-size:11.5px;color:var(--b3-theme-on-surface-light);margin-bottom:4px";
+    gridLabel.textContent = `正文图片（${candidates.length} 张，点击直接选用）`;
+    gridWrap.appendChild(gridLabel);
+
+    const grid = document.createElement("div");
+    // 单张卡片宽度约 96px，自动按容器宽度铺；最多 3 行后出现滚动条。
+    grid.style.cssText =
+      "display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:6px;max-height:240px;overflow:auto;padding:2px";
+    gridWrap.appendChild(grid);
+
+    for (const url of candidates) {
+      const card = document.createElement("div");
+      card.title = url;
+      card.style.cssText =
+        "border:1px solid var(--b3-border-color);border-radius:6px;padding:4px;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:3px;background:var(--b3-theme-surface)";
+      card.addEventListener("click", () => {
+        input.value = url;
+        refreshPreview();
+      });
+
+      const cardImg = document.createElement("img");
+      cardImg.alt = "";
+      cardImg.style.cssText =
+        "width:100%;height:64px;object-fit:cover;border-radius:4px;background:var(--b3-theme-background)";
+      const previewUrl = resolveImagePreviewUrl(url, assetBasePath);
+      if (previewUrl) cardImg.src = previewUrl;
+      else cardImg.style.opacity = "0.4";
+      cardImg.addEventListener("error", () => {
+        // 加载失败 → 仍保留卡片，但变灰，避免出现破图。
+        cardImg.style.opacity = "0.3";
+      });
+      card.appendChild(cardImg);
+
+      const cardLabel = document.createElement("div");
+      cardLabel.style.cssText =
+        "font-size:10.5px;color:var(--b3-theme-on-surface-light);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+      const display = url.split("/").at(-1) ?? url;
+      cardLabel.textContent = display;
+      card.appendChild(cardLabel);
+
+      grid.appendChild(card);
+      cardElements.push({ url, card });
+    }
+    valueBox.appendChild(gridWrap);
+  }
+
+  // 主缩略图预览区：当前 input 值对应的图。
+  const previewBox = document.createElement("div");
+  previewBox.style.cssText =
+    "display:flex;align-items:flex-start;gap:8px;padding:6px;border:1px dashed var(--b3-border-color);border-radius:6px;min-height:64px";
+  const thumb = document.createElement("img");
+  thumb.alt = "封面预览";
+  thumb.style.cssText =
+    "max-width:200px;max-height:120px;border-radius:4px;background:var(--b3-theme-surface);object-fit:cover";
+  thumb.style.display = "none";
+  const previewText = document.createElement("div");
+  previewText.style.cssText =
+    "flex:1 1 auto;font-size:11.5px;color:var(--b3-theme-on-surface-light);word-break:break-all;line-height:1.5;white-space:pre-wrap";
+  previewBox.appendChild(thumb);
+  previewBox.appendChild(previewText);
+  valueBox.appendChild(previewBox);
+
+  /** refreshGridSelection 把当前 input 值对应的卡片描边高亮，其他恢复默认。 */
+  const refreshGridSelection = (): void => {
+    const current = input.value.trim();
+    for (const { url, card } of cardElements) {
+      if (url === current) {
+        card.style.border = "2px solid var(--b3-theme-primary)";
+        card.style.padding = "3px";
+      } else {
+        card.style.border = "1px solid var(--b3-border-color)";
+        card.style.padding = "4px";
+      }
+    }
+  };
+
+  const refreshPreview = (): void => {
+    const value = input.value.trim();
+    refreshGridSelection();
+    if (!value) {
+      thumb.style.display = "none";
+      thumb.removeAttribute("src");
+      previewText.textContent = "未设置封面图。";
+      return;
+    }
+    const previewUrl = resolveImagePreviewUrl(value, assetBasePath);
+    if (previewUrl) {
+      thumb.src = previewUrl;
+      thumb.style.display = "";
+    } else {
+      thumb.style.display = "none";
+      thumb.removeAttribute("src");
+    }
+    // 文本提示：让魔尊看到原始值 + 解析后的实际加载 URL，方便排查"图为啥没出来"。
+    if (/^(https?:|data:|blob:)/i.test(value)) {
+      previewText.textContent = `远端图片：${value}`;
+    } else if (/^file:/i.test(value)) {
+      previewText.textContent = `本地文件 URL：${value}`;
+    } else if (/^[a-zA-Z]:[\\/]|^\//.test(value)) {
+      previewText.textContent = `本地路径：${value}\n（导出时会复制到 <bundle>/images/）`;
+    } else if (/^assets[\\/]/i.test(value)) {
+      previewText.textContent = `思源 assets：${value}\n（导出时会复制到 <bundle>/images/）`;
+    } else {
+      previewText.textContent = `相对路径：${value}\n（导出时按需复制到 <bundle>/images/）`;
+    }
+  };
+  // 加载失败时把缩略图收起，避免显示一个破图标。
+  thumb.addEventListener("error", () => {
+    thumb.style.display = "none";
+  });
+
+  fileButton.addEventListener("click", () => {
+    // 用一个临时 file input 触发系统选择器；type=file 在 Electron 渲染层能拿到 file.path（绝对路径）。
+    const picker = document.createElement("input");
+    picker.type = "file";
+    picker.accept = "image/*";
+    picker.style.display = "none";
+    picker.addEventListener("change", () => {
+      const file = picker.files?.[0];
+      if (!file) return;
+      // Electron 给 File 加了 path 属性指向磁盘路径；浏览器普通环境只有 name，没法拿绝对路径。
+      const electronPath = (file as File & { path?: string }).path;
+      if (electronPath) {
+        input.value = electronPath;
+      } else {
+        // 兜底：浏览器测试环境下拿不到 path，用 file://<name> 让管线能至少识别到要拷贝。
+        input.value = `file:///${file.name}`;
+      }
+      refreshPreview();
+      picker.remove();
+    });
+    document.body.appendChild(picker);
+    picker.click();
+  });
+
+  clearButton.addEventListener("click", () => {
+    input.value = "";
+    refreshPreview();
+  });
+
+  input.addEventListener("input", refreshPreview);
+  refreshPreview();
+
+  return () => input.value.trim();
+}
+
 /** createFieldRow 根据字段类型渲染编辑控件并返回读取函数。 */
 function createFieldRow(
   form: HTMLElement,
@@ -499,6 +748,19 @@ function createFieldRow(
     textarea.value = stringifyObject(initialValue);
     valueBox.appendChild(textarea);
     read = () => parseObjectInput(textarea.value);
+  } else if (field.type === "image") {
+    // 封面图字段（featuredImage / featuredImagePreview）：
+    // - 一个文本输入框，显示当前值；
+    // - 紧跟一行 chip：从正文里发现的图片 URL 中选；
+    // - "本地选图…" 按钮：弹一个 <input type="file">，选完直接把绝对路径填进去；
+    // - "清空" 按钮：一键清掉值；
+    // - 缩略图预览：值变化时自动刷新（远端 URL / data URI / 本地绝对路径都尝试展示）。
+    read = createImagePicker(
+      valueBox,
+      initialValue,
+      options?.documentMarkdown ?? "",
+      options?.assetBasePath ?? "",
+    );
   } else {
     const isLong = field.key === "description" || field.key === "summary";
     const input = isLong ? document.createElement("textarea") : document.createElement("input");
@@ -574,6 +836,13 @@ export function openFrontmatterEditor(
     initial.lastmod = doc.updatedAt;
 
     const fieldGroups = splitFrontmatterFields(FIXIT_BLOG_PRESET.frontmatterFields);
+
+    // NOTE: 把 doc.markdown 注入 editorOptions.documentMarkdown，让封面图选择器能拿到候选 chip；
+    //       不直接写入 editorOptions（保持调用方对象不可变，避免影响外层闭包）。
+    const enrichedOptions: FrontmatterEditorOptions | undefined = editorOptions
+      ? { ...editorOptions, documentMarkdown: editorOptions.documentMarkdown ?? doc.markdown }
+      : undefined;
+
     let resolved = false;
     const finish = (value: FrontmatterEditorOutcome | null): void => {
       if (resolved) return;
@@ -645,12 +914,12 @@ export function openFrontmatterEditor(
 
     const commonSection = createSection(scroll, "常用字段", false);
     const commonRows = fieldGroups.common.map((field) =>
-      createFieldRow(commonSection, field, initial[field.key], editorOptions),
+      createFieldRow(commonSection, field, initial[field.key], enrichedOptions),
     );
 
     const advancedSection = createSection(scroll, "高级字段", true);
     const advancedRows = fieldGroups.advanced.map((field) =>
-      createFieldRow(advancedSection, field, initial[field.key], editorOptions),
+      createFieldRow(advancedSection, field, initial[field.key], enrichedOptions),
     );
     const fieldRows: FieldRow[] = [...commonRows, ...advancedRows];
 

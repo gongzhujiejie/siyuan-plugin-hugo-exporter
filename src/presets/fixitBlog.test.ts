@@ -24,11 +24,13 @@ describe("FIXIT_BLOG_PRESET", () => {
       "math",
       "draft",
       "collections",
+      "featuredImage",
       "toc",
       "comment",
       "password",
       "summary",
       "typeit",
+      "featuredImagePreview",
     ]);
   });
 });
